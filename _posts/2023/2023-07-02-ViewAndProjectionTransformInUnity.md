@@ -35,8 +35,8 @@ category: Unity
 在C#中用代码验证：
 
 ```csharp
-Vector3 rotation = new Vector3(GetComponent<Camera>().transform.eulerAngles.x,
-            GetComponent<Camera>().transform.eulerAngles.y,GetComponent<Camera>().transform.eulerAngles.z);
+var cameraTransform = GetComponent<Camera>().transform;
+Vector3 rotation = new Vector3(cameraTransform.eulerAngles.x, cameraTransform.eulerAngles.y, cameraTransform.eulerAngles.z);
 
 // Rotate around z-axis
 float cosAlpha = Mathf.Cos(Mathf.Deg2Rad * rotation.z);
@@ -66,8 +66,7 @@ Matrix4x4 rotateY = new Matrix4x4(
     new Vector4(0, 0, 0, 1));
 
 // Translate matrix
-Vector3 position = new Vector3(GetComponent<Camera>().transform.position.x,
-    GetComponent<Camera>().transform.position.y, GetComponent<Camera>().transform.position.z);
+Vector3 position = new Vector3(cameraTransform.position.x, cameraTransform.position.y, cameraTransform.position.z);
 Matrix4x4 translate = new Matrix4x4(
     new Vector4(1, 0, 0, 0),
     new Vector4(0, 1, 0, 0),
