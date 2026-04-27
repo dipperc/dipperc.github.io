@@ -41,6 +41,11 @@ layout: base
     {{ content }}
   </div>
 
+  {%- assign content_lower = content | downcase -%}
+  {%- if content_lower contains 'language-mermaid' -%}
+    {%- include mermaid.html -%}
+  {%- endif -%}
+
   {%- if site.disqus.shortname -%}
     {%- include disqus_comments.html -%}
   {%- endif -%}
