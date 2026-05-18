@@ -21,7 +21,7 @@
 
     window.mermaid.initialize({
       startOnLoad: false,
-      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default"
+      theme: "default"
     });
 
     window.mermaid.run({ nodes: document.querySelectorAll(".mermaid") }).catch(function (error) {
