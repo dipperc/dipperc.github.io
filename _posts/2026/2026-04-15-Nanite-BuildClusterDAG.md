@@ -865,7 +865,7 @@ Repeat this process until there is only 1 cluster left at the root.
 
 下面展示了一个简单的流程示意图：
 
-![001_2026-04-15-Nanite_BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite_BuildClusterDAG/001_2026-04-15-Nanite_BuildClusterDAG.png)
+![001_2026-04-15-Nanite-BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite-BuildClusterDAG/001_2026-04-15-Nanite-BuildClusterDAG.png)
 
 第一步（上图左），黄色、红色、绿色和蓝色这 4 个 leaf cluster 被划分到同一个 group 中，它们是 LOD0 层；
 
@@ -1535,7 +1535,7 @@ while(1)
 
 下图展示了一个 cluster DAG 中的一部分，每个圆形代表一个 cluster：
 
-![002_2026-04-15-Nanite_BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite_BuildClusterDAG/002_2026-04-15-Nanite_BuildClusterDAG.png)
+![002_2026-04-15-Nanite-BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite-BuildClusterDAG/002_2026-04-15-Nanite-BuildClusterDAG.png)
 
 最终的 `Clusters` 数组和 `Groups` 数组的数据结构大致是：
 
@@ -1694,7 +1694,7 @@ while( true )
 
 下面一张图展示了一个 DAG 切面的例子，橙色虚线就是最终找到的切面：
 
-![003_2026-04-15-Nanite_BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite_BuildClusterDAG/003_2026-04-15-Nanite_BuildClusterDAG.png)
+![003_2026-04-15-Nanite-BuildClusterDAG](/assets/images/2026/2026-04-15-Nanite-BuildClusterDAG/003_2026-04-15-Nanite-BuildClusterDAG.png)
 
 <!-- ## 2. 运行时：渲染与 Streaming -->
 
