@@ -888,28 +888,37 @@ category: Unreal Engine
     `StripDesc.Bitmasks` 则是记录每个三角形的 strip 编码信息，首先 `[4]` 表示的是 4 个 DWORD，根据三角形索引 `TriangleIndex >> 5` 可以快速得到这个三角形所属的 DWORD，而通过 `( NewTriangleIndex & 31u )` 又可以得到这个三角形在 `StripDesc.Bitmasks[TriangleIndex >> 5]` 这 3 个 `uint32` 中对应的 bit 位，每个 `uint32` 中对应 bit 位中记录了这个三角形的 strip 编码信息：
 
     其中 `StripDesc.Bitmasks[TriangleIndex >> 5][0]` 对应的 bit 位中记录此三角形是否是一个 strip 的起点，bit 位为 1 则代表是一个 strip 的起点；
-    
+
     如果此三角形是一个 strip 的起点，那么对应的在 `StripDesc.Bitmasks[TriangleIndex >> 5][1]` 和 `StripDesc.Bitmasks[TriangleIndex >> 5][2]` 中这 2 bit 组合起来记录了这个 strip 起点三角形中 ref 顶点数量（`0..2`），其中 `StripDesc.Bitmasks[TriangleIndex >> 5][1]` 是高位，`StripDesc.Bitmasks[TriangleIndex >> 5][2]` 是低位。
 
     而如果此三角形不是一个 strip 的起点，也就是说它是一个 strip 的延伸，那么对应的在 `StripDesc.Bitmasks[TriangleIndex >> 5][1]` 中的 bit 位记录这个三角形是从左边还是右边延伸过来的，对应的在 `StripDesc.Bitmasks[TriangleIndex >> 5][2]` 中的 bit 位则记录这个三角形的第 3 个顶点是否是 ref 顶点，因为延伸的三角形的前面 2 个顶点肯定是 ref 顶点。
 
-    最后，则是 Nanite 通过 stripify 信息重建 cluster 的顶点索引 `Indexes`，通过下面的逻辑也会对 stripify 后的数据结构有一个更深的理解：
+    最后，则是 Nanite 通过 stripify 信息重建 cluster 的顶点索引 `Indexes`，核心的逻辑在 `UnpackTriangleIndices()` 方法中，下面通过对重建 `Indexes` 的源码分析加深对 stripify 后数据结构的理解：
 
     ```cpp
     static void UnpackTriangleIndices( const FStripDesc& StripDesc, const uint8* StripIndexData, uint32 TriIndex, uint32* OutIndices )
     {
+        // 当前三角形属于第几个 32-triangle DWORD
         const uint32 DwordIndex = TriIndex >> 5;
+        // 当前三角形在 DWORD 内的 bit 位置
         const uint32 BitIndex = TriIndex & 31u;
 
         //Bitmask.x: bIsStart, Bitmask.y: bIsRight, Bitmask.z: bIsNewVertex
+        // [ Reset, IsLeft, IsRef ]
+        // 当前 DWORD 的 Reset mask: 某 bit 为 1 则表示该三角形是 strip 起点
         const uint32 SMask = StripDesc.Bitmasks[ DwordIndex ][ 0 ];
+        // 当前 DWORD 的 IsLeft mask: 非 strip 起点时表示是否是左侧延伸扩展; strip 起点时与 IsRef mask 组合成 2 bits 表示 ref 顶点数量 (IsLeft mask 在高位, IsRef mask 在低位)
         const uint32 LMask = StripDesc.Bitmasks[ DwordIndex ][ 1 ];
+        // 当前 DWORD 的 IsRef mask: 非 strip 起点时表示第 3 个顶点是否是 ref 顶点; strip 起点时与 IsLeft mask 组合成 2 bits 表示 ref 顶点数量 (IsLeft mask 在高位, IsRef mask 在低位)
         const uint32 WMask = StripDesc.Bitmasks[ DwordIndex ][ 2 ];
+        // 只保留 strip 起点三角形上 IsLeft mask 为 1 的 bit, 后面用它统计 strip 起点三角形 ref 顶点数量的高位贡献
+        // 只保留 IsLeft mask 中是 strip 起点三角形并且 bit 为 1 的 mask
         const uint32 SLMask = SMask & LMask;
         
         //const uint HeadRefVertexMask = ( SMask & LMask & WMask ) | ( ~SMask & WMask );
         const uint32 HeadRefVertexMask = ( SLMask | ~SMask ) & WMask;   // 1 if head of triangle is ref. S case with 3 refs or L/R case with 1 ref.
 
+        // 
         const uint32 PrevBitsMask = ( 1u << BitIndex ) - 1u;
         const uint32 NumPrevRefVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevRefVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
         const uint32 NumPrevNewVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevNewVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
