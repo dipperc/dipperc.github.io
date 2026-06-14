@@ -8,7 +8,9 @@ category: Unreal Engine
 - [1. 编码 Cluster DAG](#1-编码-cluster-dag)
 - [4. References](#4-references)
 
-本篇笔记是 Unreal Engine 的 Nanite 系统中关于编码 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release
+本篇笔记是 Unreal Engine 的 Nanite 系统中关于编码 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release。
+
+在 [Nanite - Build Cluster DAG](https://dipperc.github.io/2026/04/15/Nanite-BuildClusterDAG.html) 中我们知道了 Nanite 是怎么构建 cluster DAG 的，而在这篇笔记中，我们来了解一下 Nanite 是怎么将 cluster DAG 编码成运行时使用的 `Nanite::FResources` 数据的。
 
 ## 1. 编码 Cluster DAG
 

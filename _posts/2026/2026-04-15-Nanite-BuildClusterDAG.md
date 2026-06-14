@@ -21,7 +21,7 @@ category: Unreal Engine
 - [3. A Cut of Cluster DAG](#3-a-cut-of-cluster-dag)
 - [4. References](#4-references)
 
-本篇笔记是 Unreal Engine 的 Nanite 系统中关于构建 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release
+本篇笔记是 Unreal Engine 的 Nanite 系统中关于构建 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release。
 
 ## 1. 构建 Leaf Cluster
 
