@@ -903,88 +903,184 @@ category: Unreal Engine
         // 当前三角形在 DWORD 内的 bit 位置
         const uint32 BitIndex = TriIndex & 31u;
 
-        //Bitmask.x: bIsStart, Bitmask.y: bIsRight, Bitmask.z: bIsNewVertex
-        // [ Reset, IsLeft, IsRef ]
-        // 当前 DWORD 的 Reset mask: 某 bit 为 1 则表示该三角形是 strip 起点
+        // SMask: 某个三角形在 SMask 中对应 bit 位为 1 则表示该三角形是 strip 起点
         const uint32 SMask = StripDesc.Bitmasks[ DwordIndex ][ 0 ];
-        // 当前 DWORD 的 IsLeft mask: 非 strip 起点时表示是否是左侧延伸扩展; strip 起点时与 IsRef mask 组合成 2 bits 表示 ref 顶点数量 (IsLeft mask 在高位, IsRef mask 在低位)
+        // LMask:
+        //   - 对于非 strip 起点三角形, 它表示的是该三角形是否是从左侧延伸扩展而来;
+        //   - 而对于 strip 起点三角形, 它表示的是该三角形 ref 顶点数的高位 (与 IsRef mask 中的低位组合成 2 bits 记录 strip 起点三角形的 ref 顶点数);
         const uint32 LMask = StripDesc.Bitmasks[ DwordIndex ][ 1 ];
-        // 当前 DWORD 的 IsRef mask: 非 strip 起点时表示第 3 个顶点是否是 ref 顶点; strip 起点时与 IsLeft mask 组合成 2 bits 表示 ref 顶点数量 (IsLeft mask 在高位, IsRef mask 在低位)
+        // WMask:
+        //   - 对于非 strip 起点三角形, 它表示该三角形第 3 个顶点是否是 ref 顶点;
+        //   - 而对于 strip 起点三角形, 它表示的是该三角形 ref 顶点数的低位 (与 IsLeft mask 中的高位组合成 2 bits 记录 strip 起点三角形的 ref 顶点数);
         const uint32 WMask = StripDesc.Bitmasks[ DwordIndex ][ 2 ];
-        // 只保留 strip 起点三角形上 IsLeft mask 为 1 的 bit, 后面用它统计 strip 起点三角形 ref 顶点数量的高位贡献
-        // 只保留 IsLeft mask 中是 strip 起点三角形并且 bit 为 1 的 mask
+        // SLMask: 某个三角形在 SLMask 中对应的 bit 位为 1 则表示该三角形既是 strip 起点并且其 ref 顶点数高位为 1, 也就是说该三角形的 ref 顶点数 >= 2
         const uint32 SLMask = SMask & LMask;
         
         //const uint HeadRefVertexMask = ( SMask & LMask & WMask ) | ( ~SMask & WMask );
+        // 上面注释是下面代码的展开版本
+        // HeadRefVertexMask: 某个三角形的 head 顶点是否是 ref 顶点, 有以下两种情况:
+        //   - 对于非 strip 起点三角形, 它的 head 顶点是 ref 顶点则表示此三角形的第 3 个顶点是 ref 顶点, 也就是 WMask = 1;
+        //   - 而对于 strip 起点三角形, 它的 head 顶点是 ref 顶点则表示此三角形的 3 个顶点全部都是 ref 顶点, 也就是 ref 顶点数为 3;
         const uint32 HeadRefVertexMask = ( SLMask | ~SMask ) & WMask;   // 1 if head of triangle is ref. S case with 3 refs or L/R case with 1 ref.
 
-        // 
+        // PrevBitsMask: 当前 32-triangle DWORD 内, 当前三角形之前所有的三角形的 bit mask
         const uint32 PrevBitsMask = ( 1u << BitIndex ) - 1u;
+        // 当前 32-triangle DWORD 之前累计的 ref 顶点数
         const uint32 NumPrevRefVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevRefVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
+        // 当前 32-triangle DWORD 之前累计的新顶点数
         const uint32 NumPrevNewVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevNewVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
 
+        // 在当前 32-triangle DWORD 内当前三角形之前累计的 ref 顶点数, 其中:
+        //   - ( FMath::CountBits( SLMask & PrevBitsMask ) << 1 ) : 累计是 strip 起点并且其 ref 顶点数高位为 1 的三角形的 ref 顶点数, 因为是是高位所以会有左移 1 位乘以 2 的计算;
+        //   - FMath::CountBits( WMask & PrevBitsMask ) : 累计是 strip 起点并且其 ref 顶点数低位为 1 或者不是 strip 起点但其 head 顶点是 ref 顶点的三角形的 ref 顶点数;
         int32 CurrentDwordNumPrevRefVertices = ( FMath::CountBits( SLMask & PrevBitsMask ) << 1 ) + FMath::CountBits( WMask & PrevBitsMask );
+        // 在当前 32-triangle DWORD 内当前三角形之前累计的新顶点数, 其中:
+        //   - 首先我们知道: 对于 strip 起点三角形最多有 3 个新顶点; 而对于非 strip 起点三角形, 最多有 1 个新顶点, 所以:
+        //     1. BitIndex                                          -> 表示当前三角形之前的每个三角形先按 1 个新顶点算
+        //     2. ( FMath::CountBits( SMask & PrevBitsMask ) << 1 ) -> 然后再给每个 strip 起点三角形补 2 个新顶点
+        //     3. 最后再减去累计的 ref 顶点数, 最终得到当前三角形之前累计的的新顶点数
         int32 CurrentDwordNumPrevNewVertices = ( FMath::CountBits( SMask & PrevBitsMask ) << 1 ) + BitIndex - CurrentDwordNumPrevRefVertices;
 
+        // 当前三角形之前累计的总的 ref 顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的 ref 顶点数 以及 当前 32-triangle DWORD 内当前三角形之前累计的 ref 顶点数
         int32 NumPrevRefVertices    = NumPrevRefVerticesBeforeDword + CurrentDwordNumPrevRefVertices;
+        // 当前三角形之前累计的总的新顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的新顶点数 以及 当前 32-triangle DWORD 内当前三角形之前累计的新顶点数
         int32 NumPrevNewVertices    = NumPrevNewVerticesBeforeDword + CurrentDwordNumPrevNewVertices;
 
+        // 当前三角形是否是 strip 起点三角形
         const int32 IsStart = BitFieldExtractI32( SMask, 1, BitIndex);      // -1: true, 0: false
+        // 当前三角形的 LMask bit
         const int32 IsLeft  = BitFieldExtractI32( LMask, 1, BitIndex );     // -1: true, 0: false
+        // 当前三角形的 WMask bit
         const int32 IsRef   = BitFieldExtractI32( WMask, 1, BitIndex );     // -1: true, 0: false
 
+        // BaseVertex 是: 当前三角形之前, 最后一个输出的新顶点的索引, 也就是最近新顶点的索引
+        // 而 ref 顶点的 5-bit delta 编码的是: 引用的顶点相对最近新顶点的距离
+        // 所以这里先算出最近新顶点的索引 BaseVertex
         const uint32 BaseVertex = NumPrevNewVertices - 1u;
 
+        // StripIndexData 里每个 ref 顶点占 5-bit, 按直觉当前三角形的第一个 ref 顶点的 5-bit delta 应该从 NumPrevRefVertices * 5 开始读
+        /*
+            因为 ～(-1) = 0, ~(0) = -1, 也就是说 ( NumPrevRefVertices + ~IsStart ) * 5 等价于:
+
+            if (IsStart)
+            {
+                readOffset = NumPrevRefVertices * 5;
+            }
+            else
+            {
+                NumPrevRefVertices = ( NumPrevRefVertices - 1 ) * 5;
+            }
+        */
+        // 对非 strip 起点的三角形的 ref 顶点进行解码时, 可能不仅需要当前三角形自己的 ref 顶点, 还有可能需要前一个三角形的 head 顶点来恢复共享边上的顶点, 所以这里会额外往前读一个 5-bit delta
         uint32 IndexData = ReadUnalignedDword( StripIndexData, ( NumPrevRefVertices + ~IsStart ) * 5 ); // -1 if not Start
 
+        // 当前三角形是 strip 起点三角形, strip 起点三角形的 3 个顶点都要独立计算
         if( IsStart )
         {
+            // 因为 IsLeft 和 IsRef 的值是 -1: true, 0: false
+            // 所以这里是负数形式的 ref 顶点数量
+            // 0/1/2/3 个 ref 顶点分别对应的 MinusNumRefVertices 值是 0/-1/-2/-3
             const int32 MinusNumRefVertices = ( IsLeft << 1 ) + IsRef;
+
+            // 当前最新的新顶点索引
             uint32 NextVertex = NumPrevNewVertices;
 
+            // 如果至少有 1 个 ref 顶点, 解码 OutIndices[ 0 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到顶点索引; 否则 OutIndices[ 0 ] 是一个新顶点, 分配当前最新的新顶点索引, 然后 NextVertex++
             if( MinusNumRefVertices <= -1 ) { OutIndices[ 0 ] = BaseVertex - ( IndexData & 31u ); IndexData >>= 5; } else { OutIndices[ 0 ] = NextVertex++; }
+            // 至少有 2 个 ref 顶点, 继续解码 OutIndices[ 1 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到顶点索引; 否则 OutIndices[ 1 ] 是一个新顶点, 分配当前最新的新顶点索引, 然后 NextVertex++
             if( MinusNumRefVertices <= -2 ) { OutIndices[ 1 ] = BaseVertex - ( IndexData & 31u ); IndexData >>= 5; } else { OutIndices[ 1 ] = NextVertex++; }
+            // 3 个顶点都是 ref 顶点, 继续解码 OutIndices[ 2 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到顶点索引; 否则 OutIndices[ 2 ] 是一个新顶点, 分配当前最新的新顶点索引, 然后 NextVertex++
             if( MinusNumRefVertices <= -3 ) { OutIndices[ 2 ] = BaseVertex - ( IndexData & 31u );                  } else { OutIndices[ 2 ] = NextVertex++; }
         }
         else
         {
             // Handle two first vertices
+
+            // 当前三角形是非 strip 起点三角形, 也就是说它是 strip 延伸扩展出来的, 所以理论上它的前 2 个顶点来自已有边, 都是 ref 顶点
+
+            // 前一个三角形在当前 DWORD 内的 bit 位置
             const uint32 PrevBitIndex = BitIndex - 1u;
+            // 前一个三角形是否是 strip 起点三角形
             const int32 IsPrevStart = BitFieldExtractI32( SMask, 1, PrevBitIndex);
+            // 前一个三角形的 head 顶点是否是 ref 顶点
             const int32 IsPrevHeadRef = BitFieldExtractI32( HeadRefVertexMask, 1, PrevBitIndex );
             //const int NumPrevNewVerticesInTriangle = IsPrevStart ? ( 3u - ( bfe_u32( /*SLMask*/ LMask, PrevBitIndex, 1 ) << 1 ) - bfe_u32( /*SMask &*/ WMask, PrevBitIndex, 1 ) ) : /*1u - IsPrevRefVertex*/ 0u;
+            // 计算前一个三角形自身有多少个新顶点
             const int32 NumPrevNewVerticesInTriangle = IsPrevStart & ( 3u - ( (BitFieldExtractU32( /*SLMask*/ LMask, 1, PrevBitIndex) << 1 ) | BitFieldExtractU32( /*SMask &*/ WMask, 1, PrevBitIndex) ) );
             
             //OutIndices[ 1 ] = IsPrevRefVertex ? ( BaseVertex - ( IndexData & 31u ) + NumPrevNewVerticesInTriangle ) : BaseVertex; // BaseVertex = ( NumPrevNewVertices - 1 );
+            // 解码 OutIndices[ 1 ]:
+            //   - 如果前一个三角形的 head 顶点是 ref 顶点, 则用 ( IndexData & 31u ) 取前一个 ref delta, 再加上 NumPrevNewVerticesInTriangle 做前一个三角形是 strip 起点情况的偏移修正
+            //   - 如果前一个三角形的 head 顶点不是 ref 顶点, 则直接使用 BaseVertex
             OutIndices[ 1 ] = BaseVertex + ( IsPrevHeadRef & ( NumPrevNewVerticesInTriangle - ( IndexData & 31u ) ) );
             //OutIndices[ 2 ] = IsRefVertex ? ( BaseVertex - bfe_u32( IndexData, 5, 5 ) ) : NumPrevNewVertices;
+            // 解码 OutIndices[ 2 ]:
+            //   - 如果当前三角形的 head 顶点是 ref 顶点, 则用 IndexData 的第 2 个 5-bit delta 解码
+            //   - 如果当前三角形的 head 顶点不是 ref 顶点, 则直接是 NumPrevNewVertices
             OutIndices[ 2 ] = NumPrevNewVertices + ( IsRef & ( -1 - BitFieldExtractU32( IndexData, 5, 5 ) ) );
 
             // We have to search for the third vertex. 
             // Left triangles search for previous Right/Start. Right triangles search for previous Left/Start.
+
+            // 解码 OutIndices[ 0 ]: 如果是左扩展, 则要找之前最近的右扩展或者 strip 起点三角形; 如果是右扩展, 则需要找之前最近的左扩展或 strip 起点三角形;
+
+            // SMask | ( LMask ^ IsLeft ):
+            //   - SMask: 保证 strip 起点三角形总是候选;
+            //   - ( LMask ^ IsLeft ): 如果当前三角形是左扩展, LMask ^ (-1) = ~LMask, 找右扩展; 如果当期三角形是右扩展, LMask ^ 0 = LMask, 找左扩展
             const uint32 SearchMask = SMask | ( LMask ^ IsLeft );               // SMask | ( IsRight ? LMask : RMask );
+
+            // 当前三角形之前的候选里找最高 bit 位代表的三角形, 也就是离当前三角形最近的候选三角形
             const uint32 FoundBitIndex = FMath::FloorLog2( SearchMask & PrevBitsMask );
+            // 这个候选三角形是不是 strip 起点三角形
             const int32 IsFoundCaseS = BitFieldExtractI32( SMask, 1, FoundBitIndex );       // -1: true, 0: false
 
+            // 当前 32-triangle DWORD 内, 这个候选三角形之前所有的三角形的 bit mask
             const uint32 FoundPrevBitsMask = ( 1u << FoundBitIndex ) - 1u;
+            // 在当前 32-triangle DWORD 内候选三角形之前累计的 ref 顶点数
             int32 FoundCurrentDwordNumPrevRefVertices = ( FMath::CountBits( SLMask & FoundPrevBitsMask ) << 1 ) + FMath::CountBits( WMask & FoundPrevBitsMask );
+            // 在当前 32-triangle DWORD 内候选三角形之前累计的 ref 顶点数
             int32 FoundCurrentDwordNumPrevNewVertices = ( FMath::CountBits( SMask & FoundPrevBitsMask ) << 1 ) + FoundBitIndex - FoundCurrentDwordNumPrevRefVertices;
 
+            // 候选三角形之前累计的总的 ref 顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的 ref 顶点数 以及 当前 32-triangle DWORD 内候选三角形之前累计的 ref 顶点数
             int32 FoundNumPrevNewVertices = NumPrevNewVerticesBeforeDword + FoundCurrentDwordNumPrevNewVertices;
+            // 候选三角形之前累计的总的新顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的新顶点数 以及 当前 32-triangle DWORD 内候选三角形之前累计的新顶点数
             int32 FoundNumPrevRefVertices = NumPrevRefVerticesBeforeDword + FoundCurrentDwordNumPrevRefVertices;
 
+            // 候选三角形的 ref 顶点数量
             const uint32 FoundNumRefVertices = (BitFieldExtractU32( LMask, 1, FoundBitIndex ) << 1 ) + BitFieldExtractU32( WMask, 1, FoundBitIndex );
+            // 候选三角形的前一个三角形的 head 顶点是否是 ref 顶点
             const uint32 IsBeforeFoundRefVertex = BitFieldExtractU32( HeadRefVertexMask, 1, FoundBitIndex - 1 );
 
             // ReadOffset: Where is the vertex relative to triangle we searched for?
+            // 读取候选三角形的 5-bit delta 时的偏移:
+            //   - 如果候选三角形是 strip 起点且当前三角形是左扩展, 则要读候选三角形的第 2 个 5-bit delta, 所以 ReadOffset = -1, 后续 ( FoundNumPrevRefVertices - ReadOffset ) 也就是 ( FoundNumPrevRefVertices + 1 );
+            //   - 如果候选三角形是 strip 起点且当前三角形是右扩展, 则读第 1 个 5-bit delta, 所以 ReadOffset = 0;
+            //   - 如果候选三角形不是 strip 起点, 则读候选三角形前一个 5-bit delta, 所以 ReadOffset = 1;
             const int32 ReadOffset = IsFoundCaseS ? IsLeft : 1;
             const uint32 FoundIndexData = ReadUnalignedDword( StripIndexData, ( FoundNumPrevRefVertices - ReadOffset ) * 5 );
+
+            // ( FoundNumPrevNewVertices - 1u ): 是 FoundBaseVertex
+            // BitFieldExtractU32( FoundIndexData, 5, 0 ): 是 5-bit delta
+            // 解码真实顶点索引
             const uint32 FoundIndex = ( FoundNumPrevNewVertices - 1u ) - BitFieldExtractU32( FoundIndexData, 5, 0 );
 
+            // 决定是否应该使用 FoundIndex
+            // 如果候选三角形是 strip 起点, 则:
+            //   - 如果当前三角形是右扩展, 则候选三角形至少要有 1 个 ref 顶点;
+            //   - 如果当前三角形是左扩展, 则候选三角形至少要有 2 个 ref 顶点;
+            // 而如果候选三角形不是 strip 起点, 则候选三角形的前一个三角形的 head 顶点必须是 ref 顶点
             bool bCondition = IsFoundCaseS ? ( (int32)FoundNumRefVertices >= 1 - IsLeft ) : (IsBeforeFoundRefVertex != 0u);
+            // 如果不能用 FoundIndex, 那么应该使用哪个新顶点索引:
+            //   - 候选三角形是 strip 起点并且没有 ref 顶点时:
+            //     - 当前三角形是右扩展, 新顶点索引是: FoundNumPrevNewVertices;
+            //     - 当前三角形是左扩展, 新顶点索引是: FoundNumPrevNewVertices + 1;
+            //   - 候选三角形是 strip 起点但有 ref 顶点时, 新顶点索引是: FoundNumPrevNewVertices;
+            //   - 候选三角形不是 strip 起点, 新顶点索引是: FoundNumPrevNewVertices - 1;
             int32 FoundNewVertex = FoundNumPrevNewVertices + ( IsFoundCaseS ? ( IsLeft & ( FoundNumRefVertices == 0 ) ) : -1 );
+            // 满足条件就使用 FoundIndex, 否则使用推导的新顶点 FoundNewVertex
             OutIndices[ 0 ] = bCondition ? FoundIndex : FoundNewVertex;
 
+            // 如果当前三角形是左扩展, 那么前面解码出来的第 2, 3 个顶点的顺序需要反过来, 这样才能恢复正确的三角形顶点排列
             if( IsLeft )
             {
                 // swap
@@ -992,26 +1088,6 @@ category: Unreal Engine
             }
             check(OutIndices[0] != OutIndices[1] && OutIndices[0] != OutIndices[2] && OutIndices[1] != OutIndices[2]);
         }
-    }
-
-    const uint32 PaddedSize = Cluster.StripIndexData.Num() + 5;
-    TArray<uint8> PaddedStripIndexData;
-    PaddedStripIndexData.Reserve( PaddedSize );
-
-    PaddedStripIndexData.Add( 0 );  // TODO: Workaround for empty list and reading from negative offset
-    PaddedStripIndexData.Append( Cluster.StripIndexData );
-
-    // UnpackTriangleIndices is 1:1 with the GPU implementation.
-    // It can end up over-fetching because it is branchless. The over-fetched data is never actually used.
-    // On the GPU index data is followed by other page data, so it is safe.
-    
-    // Here we have to pad to make it safe to perform a DWORD read after the end.
-    PaddedStripIndexData.SetNumZeroed( PaddedSize );
-
-    // Unpack strip
-    for( uint32 i = 0; i < NumOldTriangles; i++ )
-    {
-        UnpackTriangleIndices( StripDesc, (const uint8*)(PaddedStripIndexData.GetData() + 1), i, &Cluster.Indexes[ i * 3 ] );
     }
     ```
 
