@@ -1091,6 +1091,36 @@ category: Unreal Engine
     }
     ```
 
+    因为在 stripify 的过程中对每个输出的顶点做 32 顶点窗口约束可能会复制老顶点输出新顶点从而导致 cluster 的顶点数量增加，所以最后还会检查 stripify 之后的 cluster 中的顶点数量是否超过 Nanite 限制的 `NANITE_MAX_CLUSTER_VERTICES`，如果超过了则会将此 cluster 按三角形数量二分，另外还会对拆分后的 cluster 再次进行按材质排序三角形以及 stripify 的处理，具体逻辑在 `BuildClusterFromClusterTriangleRange()` 方法中，这里就不再展开分析源码了：
+
+    ```cpp
+    // Constrain clusters
+    const uint32 NumOldClusters = Clusters.Num();
+    for( uint32 i = 0; i < NumOldClusters; i++ )
+    {
+        TotalNewTriangles += Clusters[ i ].NumTris;
+        TotalNewVertices += Clusters[ i ].Verts.Num();
+        
+        // 二分顶点数量超过 NANITE_MAX_CLUSTER_VERTICES 的 cluster
+        if( Clusters[ i ].Verts.Num() > NANITE_MAX_CLUSTER_VERTICES && Clusters[i].NumTris )
+        {
+            FCluster ClusterA, ClusterB;
+            // 按三角形数量二分
+            uint32 NumTrianglesA = Clusters[ i ].NumTris / 2;
+            uint32 NumTrianglesB = Clusters[ i ].NumTris - NumTrianglesA;
+            // 分别构建 2 个子 cluster, 并且继续对它们进行按材质排序三角形和 stripify 的处理
+            BuildClusterFromClusterTriangleRange( Clusters[ i ], ClusterA, 0, NumTrianglesA );
+            BuildClusterFromClusterTriangleRange( Clusters[ i ], ClusterB, NumTrianglesA, NumTrianglesB );
+            // ClusterA 替代原 cluster
+            Clusters[ i ] = ClusterA;
+            // ASSEMBLYTODO Many groups might reference this cluster.
+            // 将 ClusterB 添加到 Clusters 数组中, 并且将其在 Clusters 数组中的索引添加到原 cluster 所在的 group 中
+            ClusterGroups[ ClusterB.GroupIndex ].Children.Add( FClusterRef( Clusters.Num() ) );
+            Clusters.Add( ClusterB );
+        }
+    }
+    ```
+
 ## 4. References
 
 - [Nanite: A Deep Dive](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
