@@ -46,7 +46,7 @@ FORCEINLINE uint32 Cycle3( uint32 Value )
 }
 ```
 
-对于有向三角形边 EdgeIndex，分别取其 2 个端点的位置 `Position0` 和 `Position1`，以 `(Position0, Position1)` 顺序计算这条有向三角形边的 hash，最后将结果添加到 `FEdgeHash::HashTable` 中，其中 Key 是有向三角形边 EdgeIndex 的 hash，Value 是有向三角形边的索引 EdgeIndex ：
+对于有向三角形边 EdgeIndex，分别取其 2 个端点的位置 `Position0` 和 `Position1`，以 `(Position0, Position1)` 顺序计算这条有向三角形边的 hash，最后将结果添加到 `FEdgeHash::HashTable` 中，其中 Key 是有向三角形边 EdgeIndex 的 hash，Value 是有向三角形边的索引 EdgeIndex：
 
 ```cpp
 template< typename FGetPosition >
@@ -113,7 +113,7 @@ void ForAllMatching( int32 EdgeIndex, bool bAdd, FGetPosition&& GetPosition, Fun
 }
 ```
 
-通过 `FEdgeHash::HashTable` 查找每条有向三角形边的共享边，并将其共享边数量写入 `FAdjacency::Direct` ：
+通过 `FEdgeHash::HashTable` 查找每条有向三角形边的共享边，并将其共享边数量写入 `FAdjacency::Direct`：
 
 ```cpp
 // 并行遍历所有有向三角形边
@@ -296,7 +296,7 @@ inline uint32 FDisjointSet::Find( uint32 i )
 
 首先构建三角形图（Triangle Graph），每个三角形是图中的一个节点，节点与节点之间的边有两类：第一类是**拓扑邻接**，第二类是**空间局部性邻接**，最后使用 METIS 递归二分图，直到每个分区图不超过 128 个节点，也就是 128 个三角形。
 
-Nanite 中一个 cluster 包含 128 个三角形（`FCluster::ClusterSize=128`），在划分时每个分区三角形的目标大小是 `124 ～ 128` ：
+Nanite 中一个 cluster 包含 128 个三角形（`FCluster::ClusterSize=128`），在划分时每个分区三角形的目标大小是 `124 ～ 128`：
 
 ```cpp
 FGraphPartitioner Partitioner( NumTriangles, FCluster::ClusterSize - 4, FCluster::ClusterSize );
@@ -496,9 +496,9 @@ for( uint32 i = 0; i < NumElements; i++ )
 }
 ```
 
-对于按 Morton 编码排好序的三角形 `Indexes`，Nanite **只会为属于较小连续连通岛区间内的三角形构建空间局部邻接信息**，也就是该区间内的三角形数量小于 128。对于这些三角形，会沿排好序后的 `Indexes` 向前、后两个方向各最多执行 16 次搜索迭代，搜索过程中会**跳过同连通岛 ID 或不同分组 ID （在这里，不同分组 ID 指的是不同材质 ID）**的连续区间，从剩余候选中按**实际 3D 空间距离选出最多 5 个**最近三角形，并构建双向的空间局部邻接关系。
+对于按 Morton 编码排好序的三角形 `Indexes`，Nanite **只会为属于较小连续连通岛区间内的三角形构建空间局部邻接信息**，也就是该区间内的三角形数量小于 128。对于这些三角形，会沿排好序后的 `Indexes` 向前、后两个方向各最多执行 16 次搜索迭代，搜索过程中会**跳过同连通岛 ID 或不同分组 ID（在这里，不同分组 ID 指的是不同材质 ID）**的连续区间，从剩余候选中按**实际 3D 空间距离选出最多 5 个**最近三角形，并构建双向的空间局部邻接关系。
 
-从这里可以看出，Nanite 在构建空间局部邻接信息时，会尝试在**3D 空间上接近、材质相同，但不属于同一几何连通块的三角形之间建立空间局部邻接关系**。
+从这里可以看出，Nanite 在构建空间局部邻接信息时，会尝试在 **3D 空间上接近、材质相同，但不属于同一几何连通块的三角形之间建立空间局部邻接关系**。
 
 最后，Nanite 根据前面得到的两类邻接信息，构建 METIS 使用的图结构，并进行递归二分：
 
@@ -538,7 +538,7 @@ check( Partitioner.Ranges.Num() );
 
 图节点之间，先通过共享边信息添加拓扑邻接权重，拓扑邻接的权重是 `260`，说明 **Nanite 强烈倾向将共享真实几何边的三角形划分在同一个分区**；再通过空间局部邻接信息添加空间局部邻接权重，空间局部邻接的权重是 `1`，远远低于拓扑邻接的权重，说明 Nanite 希望**3D 空间上靠近的三角形，尽量别分太远，但如果和拓扑邻接冲突，则拓扑邻接的优先级要高得多**。
 
-这里简单介绍一下 METIS ：
+这里简单介绍一下 METIS：
 
 METIS 是一个用于**图划分、有限元网格划分、稀疏矩阵重排序**的库，这里有一个关于怎么使用 METIS 库进行图划分的文章[使用 METIS 软件包进行图划分](https://www.jianshu.com/p/55e6b6897057)。另外，关于 METIS 的控制参数 `Options[ METIS_OPTION_UFACTOR ]`，它用于控制划分后子分区之间允许的不平衡程度（以千分之一为单位），简单来说：就是划分后每个子分区多可以比“理想大小”大多少。假设一个图一共有 N 个节点，要将其划分为 `k` 个子分区，那么理想情况下，每个子分区应该包含 `N/k` 个节点，如果 `Options[ METIS_OPTION_UFACTOR ] = 20`，那么每个子分区最多比理想大小多 2%（20/1000=0.02）的节点数
 
@@ -584,8 +584,6 @@ graph TD
 最终的分区结果存储在 `Partitioner.Ranges` 中，它记录了**经历了多次二分和原地重排序后的 `Partitioner.Indexes` 数组中的连续区间**，每个元素 `FRange` 表示一个分区在 `Partitioner.Indexes` 中的范围，`FRange::Begin` 是分区起点，`FRange::End` 是分区终点，`FRange::Num` 是这个分区里面三角形元素的数量。
 
 ### 1.5. 根据分区结果创建 Leaf Cluster
-
-<!-- 另外，由于原 `Partitioner.Indexes` 是根据 Morton 编码排好序后的三角形 index 数组，所以真正的原始三角形 index 还需要通过 `Partitioner.Indexes[Begin..End]` 获取。 -->
 
 根据 `Partitioner.Ranges` 中的每个 `FRange` 元素创建所有的 leaf cluster：
 
