@@ -276,7 +276,7 @@ void BuildTables( const FCluster& Cluster )
 }
 ```
 
-在详细说 `BuildTables()` 方法之前，先要说明一下上面源码中的**三角形 `Corner` 是什么**：
+在详细说 `BuildTables()` 方法之前，先要说明一下上面源码中的**三角形 `Corner` 代表的是什么**：
 
 三角形 `Corner` 的数据类型是 `uint16`，其高 14 位编码了三角形索引 `i`，低 2 位编码了三角形 `i` 中的局部顶点索引 `0/1/2`，也就是说一个三角形 Corner 表示的是三角形 `i` 的 3 个顶点中的某一个，在上面的源码中 Nanite 使用三角形 `Corner` 代表的是**它所表示的三角形顶点对面的那条有向边**，举个例子：`Corner(i, 0)` 表示的是三角形 `i` 的第 1 个顶点 `i0`，而它代表是三角形 `i` 的有向边 `i1 -> i2`；同理，`Corner(i, 1)` 代表的是三角形 `i` 的有向边 `i2 -> i0`，`Corner(i, 2)` 代表的是三角形 `i` 的有向边 `i0 -> i1`。
 
@@ -336,9 +336,9 @@ public:
     // 被访问顶点关联的三角形 mask
     uint32 TrianglesTouched[ MAX_CLUSTER_TRIANGLES_IN_DWORDS ]; // Touched triangles have had at least one of their vertices visited.
 
-    // Stripify 后最终 StripIndexData 数据的 bitmask, 描述每个三角形的 strip 信息
-    // 当三角形是 strip 起点时, 3 列分别是: Reset = 1; 三角形 ref 顶点数高 bit 位; 三角形 ref 顶点数低 bit 位(ref 顶点数 0..3 存储在 2 bits 中, 这里分别存储高 bit 和低 bit)
-    // 当三角形是 strip 延伸时, 3 列分别时: Reset = 0; 是否是从左边延伸过来的; 第 3 个顶点是否是 ref 顶点
+    // 记录每个三角形输出后的 strip 编码信息
+    // 当三角形作为 strip 起点输出时, 3 列分别是: Reset = 1; 三角形 ref 顶点数高 bit 位; 三角形 ref 顶点数低 bit 位(ref 顶点数 0..3 存储在 2 bits 中, 这里分别存储高 bit 和低 bit)
+    // 当三角形作为 strip 延伸输出时, 3 列分别时: Reset = 0; 是否是从左边延伸过来的; 第 3 个顶点是否是 ref 顶点
     uint32 StripBitmasks[ 4 ][ 3 ]; // [4][Reset, IsLeft, IsRef]
 
     uint32 NumTriangles;    // 已输出的新三角形数
@@ -346,20 +346,20 @@ public:
 };
 ```
 
-`VisitTriangle()` 方法的核心逻辑是：**读取输入三角形 Corner 所表示三角形的 3 个顶点，根据 5-bits 偏移约束决定每个顶点应该输出成一个新顶点还是 ref 顶点，并将此三角形的 strip 编码信息写入 `StripBitmasks`**。
+`VisitTriangle()` 方法的核心逻辑是：**读取输入三角形 Corner 所表示三角形的 3 个顶点，根据 5-bits 偏移约束决定每个顶点应该输出成一个 ref 顶点还是一个新顶点，最后将此三角形的 strip 编码信息写入 `StripBitmasks`**。
 
 在这里单独说明一下什么是 5-bits 偏移约束：//todo: 理解一下再说
 
 在 `VisitTriangle()` 方法中，首先会通过传入的三角形 Corner 参数获取三角形的 3 个顶点，并将这 3 个顶点关联的三角形标记为 touched：
 
 ```cpp
-// 按 Corner 0 -> Corner 1 -> Corner 2 -> Corner 0 的顺序获取三角形的 3 个顶点:
+// 按 Corner 0 -> Corner 1 -> Corner 2 -> Corner 0 的顺序获取三角形的 3 个旧顶点:
 
-// 下一个 TriangleCorner 对应的顶点
+// 下一个 TriangleCorner 对应的旧顶点
 const uint32 OldIndex0 = Cluster.Indexes[ CornerToIndex( NextCorner( TriangleCorner ) ) ];
-// 前一个 TriangleCorner 对应的顶点
+// 前一个 TriangleCorner 对应的旧顶点
 const uint32 OldIndex1 = Cluster.Indexes[ CornerToIndex( PrevCorner( TriangleCorner ) ) ];
-// 当前 TriangleCorner 对应的顶点
+// 当前 TriangleCorner 对应的旧顶点
 const uint32 OldIndex2 = Cluster.Indexes[ CornerToIndex( TriangleCorner ) ];
 
 // Mark incident triangles
@@ -370,10 +370,10 @@ for( uint32 i = 0; i < MAX_CLUSTER_TRIANGLES_IN_DWORDS; i++ )
 }
 ```
 
-第二步，对当前三角形所有可能输出的 ref 顶点进行 5-bits 偏移约束检测，通过约束检测的顶点输出为 ref 顶点，否则输出为新顶点：
+第二步，对当前三角形所有可能输出的 ref 顶点执行 **5-bits 偏移约束**检查，通过约束检查的顶点输出为 ref 顶点，否则输出为新顶点：
 
 ```cpp
-// 3 个顶点在新顶点序列中的索引
+// 3 个旧顶点在新顶点序列中的索引
 uint16& NewIndex0 = Context.OldToNewVertex[ OldIndex0 ];
 uint16& NewIndex1 = Context.OldToNewVertex[ OldIndex1 ];
 uint16& NewIndex2 = Context.OldToNewVertex[ OldIndex2 ];
@@ -382,27 +382,120 @@ uint32 OrgIndex0 = NewIndex0;
 uint32 OrgIndex1 = NewIndex1;
 uint32 OrgIndex2 = NewIndex2;
 
-// 根据 3 个顶点是否已经存在于新顶点序列中预估输出当前三角形的 3 个顶点后新顶点序列中的最新顶点索引
+// 根据 3 个旧顶点是否已经输出到新顶点序列中预估输出当前三角形的 3 个旧顶点后新顶点序列中的最新顶点索引
 uint32 NextVertexIndex = Context.NumVertices + ( NewIndex0 == INVALID_INDEX ) + ( NewIndex1 == INVALID_INDEX ) + ( NewIndex2 == INVALID_INDEX );
 
 while(true)
 {
-    // 如果顶点 OldIndex0 本来可以输出为 ref 顶点, 但是它在新顶点序列中的位置距离最新顶点太远了, 无法用 5-bits 记录偏移的方式引用顶点
-    // 但是它离访问后的尾部太远了, 无法用 5-bit delta 引用顶点
+    // 如果旧顶点 OldIndex0 已经存在于新顶点序列中, 也就意味着当前这个旧顶点可以当作 ref 顶点输出. 但是它所对应的新顶点距离当前新顶点序列中的最新顶点太远, 导致无法用 5-bits 去记录这个偏移
     if( NewIndex0 != INVALID_INDEX && NextVertexIndex - NewIndex0 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE )
     {
-        // 则将其置为 INVALID_INDEX
+        // 此时把旧顶点当作一个新顶点输出
         NewIndex0 = INVALID_INDEX;
-        // 此时需要新增一个新顶点, 所以 NextVertexIndex + 1
+        // 新顶点序列中新增了一个顶点, 所以最新顶点索引 + 1
         NextVertexIndex++;
         continue;
     }
-    // OldIndex1, OldIndex2 同理
+    // 旧顶点 OldIndex1 和旧顶点 OldIndex2 同理
     if( NewIndex1 != INVALID_INDEX && NextVertexIndex - NewIndex1 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE ) { NewIndex1 = INVALID_INDEX; NextVertexIndex++; continue; }
     if( NewIndex2 != INVALID_INDEX && NextVertexIndex - NewIndex2 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE ) { NewIndex2 = INVALID_INDEX; NextVertexIndex++; continue; }
     break;
 }
 ```
+
+在这里先通过 `Context.OldToNewVertex` 查询当前三角形的 3 个旧顶点是否已经输出到新顶点序列中，已经进入新顶点序列的旧顶点先视为 ref 顶点输出候选，否则直接视为新顶点输出。
+
+然后对 ref 顶点输出候选执行 5-bits 偏移约束检查：分别检查每个 ref 顶点引用的新顶点与实际新顶点序列中的最新顶点间的相对距离，如果这个相对距离 `>= 32`，也就说明这个相对距离无法用 5-bits 去记录，则表示这个旧顶点应该被当作新顶点输出。**需要注意的是**：这里所说的实际新顶点序列中的最新顶点还额外考虑到了当前三角形输出后的新顶点序列的情况，即：当前三角形的 3 个旧顶点也有可能输出为新顶点。
+
+第三步，将当前三角形的 strip 编码信息写入 `StripBitmasks`：
+
+```cpp
+// 当前三角形输出后的新索引
+uint32 NewTriangleIndex = Context.NumTriangles;
+// 当前三角形输出后会新增多少个新顶点
+uint32 NumNewVertices = ( NewIndex0 == INVALID_INDEX ) + ( NewIndex1 == INVALID_INDEX ) + ( NewIndex2 == INVALID_INDEX );
+
+// 当前三角形是作为 strip 起点输出
+if( bStart )
+{
+    // ( NewIndex == INVALID_INDEX ) 表示旧顶点是作为 ref 顶点输出; ( NewIndex != INVALID_INDEX ) 表示旧顶点作为新顶点输出
+    // 这里的 check 表示: 当一个三角形作为 strip 起点输出时, 它的 3 个旧顶点输出需要满足 isNew2 >= isNew1 >= isNew0, 也就是说: 当一个三角形作为 strip 起点输出, 那么它的 3 个旧顶点必须满足: 前面的顶点
+    check( ( NewIndex2 == INVALID_INDEX ) >= ( NewIndex1 == INVALID_INDEX ) );
+    check( ( NewIndex1 == INVALID_INDEX ) >= ( NewIndex0 == INVALID_INDEX ) );
+
+    // 当前三角形输出的 ref 顶点数
+    uint32 NumWrittenIndices = 3u - NumNewVertices;
+
+    // 把 ref 顶点数拆成 2 bits 存储: 0 -> 00, 1 -> 01, 2 -> 10, 3 -> 11
+    uint32 LowBit = NumWrittenIndices & 1u;
+    uint32 HighBit = (NumWrittenIndices >> 1) & 1u;
+
+    // 写入当前三角形的 strip 编码信息:
+    // 对于 strip 起点三角形来说, bitmask 0 置为 1, 表示它是一个 strip 起点
+    Context.StripBitmasks[ NewTriangleIndex >> 5 ][ 0 ] |= ( 1u << ( NewTriangleIndex & 31u ) );
+    // 对于 strip 起点三角形来说, bitmask 1 表示其输出的 ref 顶点数的高 bit
+    Context.StripBitmasks[ NewTriangleIndex >> 5 ][ 1 ] |= ( HighBit << ( NewTriangleIndex & 31u ) );
+    // 对于 strip 起点三角形来说, bitmask 2 表示其输出的 ref 顶点数的低 bit
+    Context.StripBitmasks[ NewTriangleIndex >> 5 ][ 2 ] |= ( LowBit << ( NewTriangleIndex & 31u ) );
+}
+else    // 当前三角形作为 strip 延伸输出
+{
+    // 这里的 check 表示: 当一个三角形作为 strip 延伸输出时, 它的 3 个旧顶点输出需要满足: 前 2 个旧顶点需要作为 ref 顶点输出
+    check( NewIndex0 != INVALID_INDEX );
+    check( NewIndex1 != INVALID_INDEX );
+
+    // 写入当前三角形的 strip 编码信息:
+    // 对于 strip 延伸三角形来说, bitmask 0 置为 0, 这里直接不需要处理
+    // 对于 strip 延伸三角形来说, bitmask 1 表示其是否从左侧延伸过来的, !bRight 也就是 IsLeft
+    if( !bRight )
+    {
+        Context.StripBitmasks[ NewTriangleIndex >> 5 ][ 1 ] |= ( 1u << ( NewTriangleIndex & 31u ) );
+    }
+
+    // 对于 strip 延伸三角形来说, 其最后一个旧顶点通常是作为新顶点输出, 这里的 bitmask 2 表示最后一个顶点是否是作为 ref 顶点输出
+    if(NewIndex2 != INVALID_INDEX)
+    {
+        Context.StripBitmasks[ NewTriangleIndex >> 5 ][ 2 ] |= ( 1u << ( NewTriangleIndex & 31u ) );
+    }
+}
+```
+
+这里详细说说 `StripBitmasks` 数据，它记录了每个三角形输出后的 strip 编码信息
+
+这里详细说说 `StripBitmasks` 数据，它是一个 `4x3` 二维 `uint32` 数组，其中每 1 列的 `uint32` 中的每 1 bit 记录了其对应三角形输出后的 1 种 strip 编码信息，一共 3 列总共记录了 `[Reset, IsLeft, IsRef]` 这 3 种 strip 编码信息：
+
+当一个三角形作为 strip 起点输出时，此三角形所对应的第 1 列 `uint32` 中的 bit 位是 1，表示它是一个 strip 起点；然后将当前三角形输出的 ref 顶点数拆成 2 bits 存储，高 bit 存储在此三角形所对应的第 2 列 `uint32` 中的 bit 位中，高 bit 存储在此三角形所对应的第 3 列 `uint32` 中的 bit 位中；
+
+而当一个三角形作为 strip 延伸输出时，此三角形所对应的第 1 列 `uint32` 中的 bit 位是 0，表示它是一个 strip 延伸；此三角形所对应的第 2 列 `uint32` 中的 bit 位记录延伸方向（左侧还是右侧）；另外对于输出为 strip 延伸的三角形，它的前 2 个顶点必须作为 ref 顶点输出，所以此三角形所对应的第 3 列 `uint32` 中的 bit 位记录其第 3 个顶点是否是作为 ref 顶点输出；
+
+将当前三角形的 strip 编码信息写入 `StripBitmasks` 之后，Nanite 会为即将作为新顶点输出的旧顶点分配其在新顶点序列中的新索引，然后记录旧顶点索引到新顶点索引的映射，接着将当前三角形标记为已输出并且将其从候选集合中移除，最后返回当前三角形输出的新顶点数：
+
+```cpp
+if( NewIndex0 == INVALID_INDEX )
+{
+    // 给旧顶点 OldIndex0 分配新顶点索引, 并将已输出的新顶点序列中的新顶点数 + 1
+    // 另外这里的 NewIndex0 是引用, 所以同步更新了旧顶点索引到新顶点索引的映射
+    NewIndex0 = uint16(Context.NumVertices++);
+    // 记录新顶点索引到旧顶点索引的映射
+    Context.NewToOldVertex[ NewIndex0 ] = uint16(OldIndex0);
+}
+// OldIndex1, OldIndex2 同理
+if( NewIndex1 == INVALID_INDEX ) { NewIndex1 = uint16(Context.NumVertices++); Context.NewToOldVertex[ NewIndex1 ] = uint16(OldIndex1); }
+if( NewIndex2 == INVALID_INDEX ) { NewIndex2 = uint16(Context.NumVertices++); Context.NewToOldVertex[ NewIndex2 ] = uint16(OldIndex2); }
+
+// 已输出的三角形数量 + 1
+Context.NumTriangles++;
+
+// 从 Corner 中解码出旧三角形索引
+const uint32 OldTriangleIndex = CornerToTriangle( TriangleCorner );
+// 把当前三角形标记为已输出, 防止后续再次被输出
+Context.TrianglesEnabled[ OldTriangleIndex >> 5 ] &= ~( 1u << ( OldTriangleIndex & 31u ) );
+
+// 返回当前三角形输出的新顶点数
+return NumNewVertices;
+```
+
+//todo: Nanite 是按材质段（`MaterialRange`）分段进行 stripify 的，这样可以保持材质分组不被打乱，避免 strip 跨材质。首先会初始化相关数据：
 
 <!-- 它会根据 cluster 的原始网格数据构建 stripify 所需的几张查找表数据 -->
 
