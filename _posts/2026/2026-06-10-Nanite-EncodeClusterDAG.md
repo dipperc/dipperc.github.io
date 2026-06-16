@@ -212,7 +212,7 @@ void BuildTables( const FCluster& Cluster )
         VertexToTriangleMasks[ i1 ][ i >> 5 ] |= 1 << ( i & 31 );
         VertexToTriangleMasks[ i2 ][ i >> 5 ] |= 1 << ( i & 31 );
 
-        // 计算三角形 3 个顶点**位置和**的 X 值, 后续选 strip 起点时, 如果评分相同, 则用它决定谁优先
+        // 计算三角形 3 个顶点**位置和**的 x 分量值, 后续选 strip 起点时, 如果评分相同, 则用它决定谁优先
         FVector3f ScaledCenter = Cluster.Verts.GetPosition( i0 ) + Cluster.Verts.GetPosition( i1 ) + Cluster.Verts.GetPosition( i2 );
         TrianglePriorities[ i ] = ScaledCenter.X;   //TODO: Find a good direction to sort by instead of just picking x?
 
@@ -280,7 +280,7 @@ void BuildTables( const FCluster& Cluster )
 
 三角形 `Corner` 的数据类型是 `uint16`，其高 14 位编码了三角形索引 `i`，低 2 位编码了三角形 `i` 中的局部顶点索引 `0/1/2`，也就是说一个三角形 Corner 表示的是三角形 `i` 的 3 个顶点中的某一个，在上面的源码中 Nanite 使用三角形 `Corner` 代表的是**它所表示的三角形顶点对面的那条有向边**，举个例子：`Corner(i, 0)` 表示的是三角形 `i` 的第 1 个顶点 `i0`，而它代表是三角形 `i` 的有向边 `i1 -> i2`；同理，`Corner(i, 1)` 代表的是三角形 `i` 的有向边 `i2 -> i0`，`Corner(i, 2)` 代表的是三角形 `i` 的有向边 `i0 -> i1`。
 
-`BuildTables()` 是在 stripify 之前的关键一步，它根据 cluster 的原始网格信息构建了 stripify 所需的数据：首先是 `VertexToTriangleMasks`，它记录 **cluster 内每个顶点关联了哪些三角形**，通过 `VertexToTriangleMasks[ vertex index ][ DWORD i ]` 可以快速知道某个 32-triangle DWORD 中有哪些三角形使用了顶点 `Verts[index]`；其次是 `OppositeCorner`，它记录**每个三角形 Corner 所代表的有向边的对象共享边所对应的三角形 Corner**，后续 stripify 时会根据此数据找左/右相邻三角形；最后 `TrianglePriorities` 则是保存每个三角形 3 个顶点**位置和**的 `X` 值，后续选 strip 起点三角形时，如果评分相同，则用它决定谁优先。
+`BuildTables()` 是在 stripify 之前的关键一步，它根据 cluster 的原始网格信息构建了 stripify 所需的数据：首先是 `VertexToTriangleMasks`，它记录 **cluster 内每个顶点关联了哪些三角形**，通过 `VertexToTriangleMasks[ vertex index ][ DWORD i ]` 可以快速知道某个 32-triangle DWORD 中有哪些三角形使用了顶点 `Verts[index]`；其次是 `OppositeCorner`，它记录**每个三角形 Corner 所代表的有向边的对象共享边所对应的三角形 Corner**，后续 stripify 时会根据此数据找左/右相邻三角形；最后 `TrianglePriorities` 则是保存每个三角形 3 个顶点**位置和**的 `x` 分量值，后续选 strip 起点三角形时，如果评分相同，则用它决定谁优先。
 
 再来看看 `NewScoreVertex()`：
 
@@ -494,6 +494,18 @@ Context.TrianglesEnabled[ OldTriangleIndex >> 5 ] &= ~( 1u << ( OldTriangleIndex
 // 返回当前三角形输出的新顶点数
 return NumNewVertices;
 ```
+
+现在总结一下上面说的 3 个关键方法的核心逻辑：
+
+`BuildTables()` 方法主要构建了 2 张 stripify 所需的查找表：`OppositeCorner` 中通过三角形 Corner 记录邻接三角形之间的共享边信息，三角形 Corner 中不仅记录了旧三角形索引，还记录了旧三角形局部的顶点索引，根据三角形 Corner 中的局部顶点索引，Nanite 不仅可以找邻接三角形，还可以找特定左侧或者右侧的邻居三角形；`TrianglePriorities` 中则保存每个旧三角形 3 个旧顶点位置和的 x 分量值，后续此表决定评分相同的三角形谁优先作为 strip 起点输出；
+
+而 `NewScoreVertex()` 方法主要是根据一个旧顶点作为 ref 顶点输出的代价以及其所在旧三角形的拓扑延伸能力为其打分，根据此评分决定 strip 起点和 strip 延伸三角形的选择；
+
+`VisitTriangle()` 是整个 stripify 过程中的核心方法，它的主要逻辑是将一个旧三角形输出到 stripify 之后的三角形序列中，并决定这个三角形的 3 个旧顶点在 stripify 之后应当编码为一个新顶点还是一个 ref 顶点。
+
+需要注意的是，对于 strip 的起点三角形，最多需要处理其 3 个顶点的编码，而对于 strip 的延伸三角形，因为其前 2 个顶点通常由 strip 拓扑隐含复用，所以只需要处理其最后 1 个顶点的编码。
+
+具体来说，对于需要编码的旧顶点，首先检查它是否已经对应到新顶点序列中的某个已输出顶点，如果还不存在于新顶点序列中，则将其作为一个新顶点编码；而如果它已经存在于新顶点序列中，则优先考虑将其作为 ref 顶点编码：通过记录其对应的已输出新顶点与当前新顶点序列末尾之间的相对距离，来引用这个已输出的新顶点。又因为 Nanite 使用 5 bits 去存储这个相对距离，所以如果这个相对距离超过了 5 bits 可以表示的范围，那么仍然会将这个旧顶点重新作为一个新顶点编码。
 
 //todo: Nanite 是按材质段（`MaterialRange`）分段进行 stripify 的，这样可以保持材质分组不被打乱，避免 strip 跨材质。首先会初始化相关数据：
 
