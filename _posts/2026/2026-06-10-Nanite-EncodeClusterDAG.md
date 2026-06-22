@@ -876,10 +876,7 @@ check( Context.NumTriangles == NumOldTriangles );
 
 因为在 stripify 的过程中，有些 ref 顶点会因为超出 5 bits 偏移约束从而被重新编码成一个新顶点，所以 `Context.NewToOldVertex` 中会存在多个索引指向同一个旧顶点的情况，这也导致最终 `Cluster.Verts` 中会存在多个相同的旧顶点。
 
-//todo:
-<!-- 重建完新的 Cluster.Verts 后，Nanite 会继续写入用于解码 Cluster.StripIndexData 数据的描述信息，也就是 Cluster.StripDesc。其中 StripDesc.Bitmasks 记录每个三角形的 strip 编码形态，NumPrevNewVerticesBeforeDwords 和 NumPrevRefVerticesBeforeDwords 记录每个 32-triangle DWORD 之前累计的新顶点数和 ref 顶点数 -->
-
-重建完新的 `Cluster.Verts` 后，Nanite 会继续写入用于解码 `Cluster.StripIndexData` 数据的描述信息，也就是 `StripDesc.Bitmasks`：
+重建完新的 `Cluster.Verts` 后，Nanite 会继续写入用于解码 `Cluster.StripIndexData` 数据的描述信息 `Cluster.StripDesc`：
 
 ```cpp
 // 计算每个 DWORD 之前 **累计** 的新增顶点数:
@@ -908,10 +905,12 @@ check(NumPrevRefVerticesBeforeDwords1 < 1024 && NumPrevRefVerticesBeforeDwords2 
 // 将 3 个累计值编码进 1 个 uint32
 StripDesc.NumPrevRefVerticesBeforeDwords = (NumPrevRefVerticesBeforeDwords3 << 20) | (NumPrevRefVerticesBeforeDwords2 << 10) | NumPrevRefVerticesBeforeDwords1;
 
-// 复制 strip bitmask
+// 写入 strip bitmask
 static_assert(sizeof(StripDesc.Bitmasks) == sizeof(Context.StripBitmasks), "");
 FMemory::Memcpy(StripDesc.Bitmasks, Context.StripBitmasks, sizeof(StripDesc.Bitmasks));
 ```
+
+在 `Cluster.StripDesc` 中，`Bitmasks` 记录每个三角形的 strip 编码元数据，而 `NumPrevNewVerticesBeforeDwords` 和 `NumPrevRefVerticesBeforeDwords` 则是记录每个 32-triangle DWORD 之前累计的新顶点数和 ref 顶点数。
 
 ## 2. 编码 Cluster DAG
 
