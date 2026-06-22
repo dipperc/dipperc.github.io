@@ -298,7 +298,7 @@ auto NewScoreVertex = [ &Weights ] ( const FContext& Context, uint32 OldVertex, 
     {
         // 计算其对应的新顶点与当前新顶点序列末尾的相对距离
         uint32 CachePosition = ( Context.NumVertices - 1 ) - NewIndex;
-        // 相对距离是否满足 5 bits 偏移约束
+        // 相对距离是否满足 5-bit 偏移约束
         if( CachePosition < NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE )
         {
             // 如果满足约束, 就从权重表取分数, 根据以下 5 个维度查表:
@@ -315,7 +315,7 @@ auto NewScoreVertex = [ &Weights ] ( const FContext& Context, uint32 OldVertex, 
 };
 ```
 
-`NewScoreVertex()` 方法的作用是给一个候选旧顶点打分。它首先检查这个旧顶点是否已经对应到新顶点序列中的某个已输出新顶点，如果还没有对应的新顶点，则这个旧顶点当前不能作为 ref 顶点使用，分数就是 0；如果已经有对应的新顶点，则计算这个新顶点与当前新顶点序列末尾之间的相对距离，也就是 `CachePosition = ( Context.NumVertices - 1 ) - NewIndex`。如果这个相对距离仍在 5 bits 可表示范围内，就可以作为 ref 顶点候选，然后根据当前候选三角形是否是 strip 起点、它的邻接三角形情况，以及这个 ref 距离去权重表里取分数。
+`NewScoreVertex()` 方法的作用是给一个候选旧顶点打分。它首先检查这个旧顶点是否已经对应到新顶点序列中的某个已输出新顶点，如果还没有对应的新顶点，则这个旧顶点当前不能作为 ref 顶点使用，分数就是 0；如果已经有对应的新顶点，则计算这个新顶点与当前新顶点序列末尾之间的相对距离，也就是 `CachePosition = ( Context.NumVertices - 1 ) - NewIndex`。如果这个相对距离仍在 5-bit 可表示范围内，就可以作为 ref 顶点候选，然后根据当前候选三角形是否是 strip 起点、它的邻接三角形情况，以及这个 ref 距离去权重表里取分数。
 
 所以 `NewScoreVertex()` 的打分主要反映两件事：这个旧顶点作为 ref 顶点是否足够“近”，以及当前候选三角形所处的拓扑上下文是否适合继续 stripify。另外提一下 `NewScoreTriangle()` 方法，它就是分别给三角形的 3 个旧顶点打分，然后把 3 个分数相加作为这个候选三角形的评分。
 
@@ -352,7 +352,7 @@ public:
 
 需要注意的是，对于 strip 的起点三角形，最多需要处理其 3 个顶点的编码；而对于 strip 的延伸三角形，因为其前 2 个顶点通常由 strip 拓扑隐含复用，所以只需要处理其新引入的那个顶点的编码。
 
-在这里单独说明一下什么是 5 bits 偏移约束：Nanite 在 `StripIndexData` 中使用 5 bits 存储 ref 顶点的相对距离，这个相对距离引用的是新顶点序列中已经输出过的某个新顶点，5 bits 中写入的是 `BaseVertex - Index`，其中 `BaseVertex` 是当前三角形输出前新顶点序列末尾的索引，`Index` 是被引用的新顶点索引。因为只有 5 bits，所以这个距离必须在 5 bits 可表示范围内，也就是小于 32。如果某个旧顶点虽然已经对应到新顶点序列中的一个已输出顶点，但距离太远，就不能继续作为 ref 顶点编码，而需要重新作为新顶点编码。
+在这里单独说明一下什么是 5-bit 偏移约束：Nanite 在 `StripIndexData` 中使用 5 bits 存储 ref 顶点的相对距离，这个相对距离引用的是新顶点序列中已经输出过的某个新顶点，这个 5-bit 字段中写入的是 `BaseVertex - Index`，其中 `BaseVertex` 是当前三角形输出前新顶点序列末尾的索引，`Index` 是被引用的新顶点索引。因为只有 5 bits，所以这个距离必须在 5-bit 可表示范围内，也就是小于 32。如果某个旧顶点虽然已经对应到新顶点序列中的一个已输出顶点，但距离太远，就不能继续作为 ref 顶点编码，而需要重新作为新顶点编码。
 
 在 `VisitTriangle()` 方法中，首先会通过传入的三角形 Corner 参数获取三角形的 3 个顶点，并将这 3 个顶点关联的三角形标记为 touched：
 
@@ -374,7 +374,7 @@ for( uint32 i = 0; i < MAX_CLUSTER_TRIANGLES_IN_DWORDS; i++ )
 }
 ```
 
-第二步，对当前三角形中可能作为 ref 顶点编码的旧顶点执行 **5 bits 偏移约束**检查，通过约束检查的顶点可以作为 ref 顶点编码，否则需要重新作为新顶点编码：
+第二步，对当前三角形中可能作为 ref 顶点编码的旧顶点执行 **5-bit 偏移约束**检查，通过约束检查的顶点可以作为 ref 顶点编码，否则需要重新作为新顶点编码：
 
 ```cpp
 // 3 个旧顶点在新顶点序列中的索引
@@ -386,7 +386,7 @@ uint32 OrgIndex0 = NewIndex0;
 uint32 OrgIndex1 = NewIndex1;
 uint32 OrgIndex2 = NewIndex2;
 
-// 根据 3 个旧顶点是否已经对应到新顶点序列，预估当前三角形处理完成后，下一个可分配的新顶点索引
+// 根据 3 个旧顶点是否已经对应到新顶点序列，预估当前三角形处理完成后，下一个可分配的新顶点序列索引
 uint32 NextVertexIndex = Context.NumVertices + ( NewIndex0 == INVALID_INDEX ) + ( NewIndex1 == INVALID_INDEX ) + ( NewIndex2 == INVALID_INDEX );
 
 while(true)
@@ -398,7 +398,7 @@ while(true)
     {
         // 此时把旧顶点重新作为一个新顶点编码
         NewIndex0 = INVALID_INDEX;
-        // 新顶点序列中会新增一个顶点，所以下一个可分配的新顶点索引 + 1
+        // 新顶点序列中会新增一个顶点，所以下一个可分配的新顶点序列索引 + 1
         NextVertexIndex++;
         continue;
     }
@@ -411,7 +411,7 @@ while(true)
 
 在这里先通过 `Context.OldToNewVertex` 查询当前三角形的 3 个旧顶点是否已经对应到新顶点序列中的某个已输出新顶点。已经存在于新顶点序列中的旧顶点，先视为 ref 顶点候选；还不存在于新顶点序列中的旧顶点，则需要作为新顶点编码。
 
-然后对 ref 顶点候选执行 5 bits 偏移约束检查：分别检查每个 ref 顶点引用的新顶点，与当前三角形处理完成后的新顶点序列末尾之间的相对距离。如果这个相对距离 `>= 32`，说明无法用 5 bits 记录，则这个旧顶点不能继续作为 ref 顶点编码，而是会被重新作为新顶点编码。这里用的是 `NextVertexIndex` 做预检查，因为当前三角形本身也可能会新增新顶点，新增的新顶点会影响其他 ref 顶点的相对距离。
+然后对 ref 顶点候选执行 5-bit 偏移约束检查：分别检查每个 ref 顶点引用的新顶点，与当前三角形处理完成后的新顶点序列末尾之间的相对距离。如果这个相对距离 `>= 32`，说明无法用 5 bits 记录，则这个旧顶点不能继续作为 ref 顶点编码，而是会被重新作为新顶点编码。这里用的是 `NextVertexIndex` 做预检查，因为当前三角形本身也可能会新增新顶点，新增的新顶点会影响其他 ref 顶点的相对距离。
 
 第三步，将当前三角形的 strip 编码信息写入 `StripBitmasks`：
 
@@ -507,7 +507,7 @@ return NumNewVertices;
 
 `VisitTriangle()` 是整个 stripify 过程中的核心方法，它的主要逻辑是将一个旧三角形输出到 stripify 之后的三角形序列中，并决定这个三角形相关的旧顶点在 stripify 之后应当编码为一个新顶点还是一个 ref 顶点。需要注意的是，对于 strip 的起点三角形，最多需要处理其 3 个顶点的编码，而对于 strip 的延伸三角形，因为其前 2 个顶点通常由 strip 拓扑隐含复用，所以只需要处理其新引入的那个顶点的编码。具体来说：
 
-对于需要编码的旧顶点，首先检查它是否已经对应到新顶点序列中的某个已输出顶点，如果还不存在于新顶点序列中，则将其作为一个新顶点编码；而如果它已经存在于新顶点序列中，则优先考虑将其作为 ref 顶点编码：通过记录其对应的已输出新顶点与当前新顶点序列末尾之间的相对距离，来引用这个已输出的新顶点。又因为 Nanite 使用 5 bits 去存储这个相对距离，所以如果这个相对距离超过了 5 bits 可以表示的范围，那么仍然会将这个旧顶点重新作为一个新顶点编码。
+对于需要编码的旧顶点，首先检查它是否已经对应到新顶点序列中的某个已输出顶点，如果还不存在于新顶点序列中，则将其作为一个新顶点编码；而如果它已经存在于新顶点序列中，则优先考虑将其作为 ref 顶点编码：通过记录其对应的已输出新顶点与当前新顶点序列末尾之间的相对距离，来引用这个已输出的新顶点。又因为 Nanite 使用 5 bits 去存储这个相对距离，所以如果这个相对距离超过了 5-bit 可表示范围，那么仍然会将这个旧顶点重新作为一个新顶点编码。
 
 说完了 `BuildTables()`、`NewScoreVertex()` 和 `VisitTriangle()` 这 3 个关键方法，下面来说说 stripify 的核心流程：
 
@@ -529,7 +529,7 @@ uint32 NumNewVerticesInDword[ 4 ] = {};
 uint32 NumRefVerticesInDword[ 4 ] = {};
 ```
 
-`Cluster.StripIndexData` 是一个连续、紧凑的 5 bits 字节流，Nanite 通过 `BitWriter.PutBits(BaseVertex - Index, 5)` 以**低位优先**的顺序向其中写入连续的 5 bits 偏移，每满 8 bits 就会将其转换为一个 `uint8` 并添加进 `Cluster.StripIndexData` 数组中。
+`Cluster.StripIndexData` 是一个连续、紧凑的 5-bit 字节流，Nanite 通过 `BitWriter.PutBits(BaseVertex - Index, 5)` 以**低位优先**的顺序向其中写入连续的 5-bit 偏移，每满 8 bits 就会将其转换为一个 `uint8` 并添加进 `Cluster.StripIndexData` 数组中。
 
 按材质段分段进行 stripify 时，首先会将当前材质段内的所有旧三角形标记为候选状态，后续 stripify 时只处理候选三角形：
 
@@ -575,7 +575,7 @@ for( uint32 Corner = 0; Corner < 3; Corner++ )
         uint32 NewIndex2 = Context.OldToNewVertex[ OldIndex2 ];
         uint32 NumVerts = Context.NumVertices + ( NewIndex0 == INVALID_INDEX ) + ( NewIndex1 == INVALID_INDEX ) + ( NewIndex2 == INVALID_INDEX );
         
-        // 对可能作为 ref 顶点编码的新顶点进行 5 bits 偏移约束检查: 如果其对应的已输出新顶点与当前新顶点序列末尾之间的相对距离超过 5 bits 可表示范围, 就必须把对应旧顶点重新作为新顶点编码
+        // 对可能作为 ref 顶点编码的新顶点进行 5-bit 偏移约束检查: 如果其对应的已输出新顶点与当前新顶点序列末尾之间的相对距离超过 5-bit 可表示范围, 就必须把对应旧顶点重新作为新顶点编码
         while(true)
         {
             if( NewIndex0 != INVALID_INDEX && NumVerts - NewIndex0 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE ) { NewIndex0 = INVALID_INDEX; NumVerts++; continue; }
@@ -661,17 +661,17 @@ if( StartCorner == INVALID_CORNER )
 {
     // 记录这个输出三角形属于第几个 DWORD
     uint32 TriangleDword = Context.NumTriangles >> 5;
-    // 输出前的新顶点序列末尾索引, 用来计算 ref 顶点的 5 bits 相对距离
+    // 输出前的新顶点序列末尾索引, 用来计算 ref 顶点的 5-bit 相对距离
     uint32 BaseVertex = Context.NumVertices - 1;
 
     // 输出这个三角形
     uint32 NumNewVertices = VisitTriangle(Context, StartCorner, true, false);
 
-    // 为 strip 起点三角形写 ref 顶点的 5 bits 相对距离:
-    // 如果 NumNewVertices = 3, 则表示 3 个顶点都是新顶点, 不写任何 5 bits 相对距离
-    // 如果 NumNewVertices = 2, 则表示第 1 个顶点是 ref 顶点, 写 1 个 5 bits 相对距离
-    // 如果 NumNewVertices = 1, 则表示前 2 个顶点是 ref 顶点, 写 2 个 5 bits 相对距离
-    // 如果 NumNewVertices = 0, 则表示 3 个顶点都是 ref 顶点, 写 3 个 5 bits 相对距离
+    // 为 strip 起点三角形写 ref 顶点的 5-bit 相对距离:
+    // 如果 NumNewVertices = 3, 则表示 3 个顶点都是新顶点, 不写任何 5-bit 相对距离
+    // 如果 NumNewVertices = 2, 则表示第 1 个顶点是 ref 顶点, 写 1 个 5-bit 相对距离
+    // 如果 NumNewVertices = 1, 则表示前 2 个顶点是 ref 顶点, 写 2 个 5-bit 相对距离
+    // 如果 NumNewVertices = 0, 则表示 3 个顶点都是 ref 顶点, 写 3 个 5-bit 相对距离
     if (NumNewVertices < 3)
     {
         uint32 Index = Context.OldToNewVertex[Cluster.Indexes[CornerToIndex(NextCorner(StartCorner))]];
@@ -698,7 +698,7 @@ if( StartCorner == INVALID_CORNER )
 
 <!-- 其中 `BaseVertex` 是当前三角形输出前新顶点序列末尾的索引，`Index` 是被引用的新顶点索引 -->
 
-**另外**：根据上面的源码逻辑可以看到，在输出 strip 起点三角形之前，会先记录当前新顶点序列末尾顶点的索引 `BaseVertex`，而在 `VisitTriangle()` 方法中，如果如果一个旧顶点被编码为一个 ref 顶点，那么它引用的就是输出当前这个 strip 起点三角形之前新顶点序列中已经存在的某个顶点，引用的顶点在新顶点序列中的索引可以根据映射 `Context.OldToNewVertex` 获取。那么也就是说：对于一个作为 ref 顶点编码的旧顶点，它所对应的 5 bits 偏移指的是：**从它所属的旧三角形输出前的新顶点序列末尾往前数多少偏移，这个偏移所对应的顶点就是它所引用的顶点**。
+**另外**：根据上面的源码逻辑可以看到，在输出 strip 起点三角形之前，会先记录当前新顶点序列末尾顶点的索引 `BaseVertex`，而在 `VisitTriangle()` 方法中，如果如果一个旧顶点被编码为一个 ref 顶点，那么它引用的就是输出当前这个 strip 起点三角形之前新顶点序列中已经存在的某个顶点，引用的顶点在新顶点序列中的索引可以根据映射 `Context.OldToNewVertex` 获取。那么也就是说：对于一个作为 ref 顶点编码的旧顶点，它所对应的 5-bit 偏移指的是：**从它所属的旧三角形输出前的新顶点序列末尾往前数多少偏移，这个偏移所对应的顶点就是它所引用的顶点**。
 
 找到并输出当前 strip 的起点三角形后，下面就开始从 strip 起点三角形开始延伸扩展当前 strip。
 
@@ -778,9 +778,9 @@ Nanite 通过 `OppositeCorner` 去找左侧或右侧候选邻接旧三角形去�
 
 也就是说，strip 延伸三角形总是沿着当前 strip 的共享边接上，当根据评分选择了要延伸的 `CurrentCorner` 后，按照 `VisitTriangle()` 中使用的局部顶点顺序，`NextCorner(CurrentCorner)` 和 `PrevCorner(CurrentCorner)` 对应的前 2 个旧顶点就是共享边上的两个顶点，`CurrentCorner` 对应的第 3 个旧顶点才是这次延伸新引入的 head 顶点。
 
-因此对于 strip 延伸三角形来说，前 2 个共享边顶点必须编码为 ref 顶点，并且还必须满足 5 bits 偏移约束，否则只能结束当前 strip 的延伸扩展，重新选择新的 strip 起点。
+因此对于 strip 延伸三角形来说，前 2 个共享边顶点必须编码为 ref 顶点，并且还必须满足 5-bit 偏移约束，否则只能结束当前 strip 的延伸扩展，重新选择新的 strip 起点。
 
-所以 Nanite 在选择了要延伸的 `CurrentCorner` 后，还会预测输出延伸旧三角形后，会不会因为延伸引入新的顶点导致新顶点序列长度增加 1 从而使共享边的 2 个 ref 顶点不再能通过 5 bits 偏移去表示：
+所以 Nanite 在选择了要延伸的 `CurrentCorner` 后，还会预测输出延伸旧三角形后，会不会因为延伸引入新的顶点导致新顶点序列长度增加 1 从而使共享边的 2 个 ref 顶点不再能通过 5-bit 偏移去表示：
 
 ```cpp
 {
@@ -799,7 +799,7 @@ Nanite 通过 `OppositeCorner` 去找左侧或右侧候选邻接旧三角形去�
     // 预估输出这个延伸旧三角形后的新顶点序列中的顶点数量
     const uint32 NextNumVertices = Context.NumVertices + ((NewIndex2 == INVALID_INDEX || Context.NumVertices - NewIndex2 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE) ? 1u : 0u);
 
-    // 判断共享边的 2 个 ref 顶点是否仍然满足 5 bits 偏移约束, 如果不满足则结束当前 strip 的延伸扩展, 重新选择新的 strip 起点
+    // 判断共享边的 2 个 ref 顶点是否仍然满足 5-bit 偏移约束, 如果不满足则结束当前 strip 的延伸扩展, 重新选择新的 strip 起点
     if (NextNumVertices - NewIndex0 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE ||
         NextNumVertices - NewIndex1 >= NANITE_CONSTRAINED_CLUSTER_CACHE_SIZE)
         break;
@@ -816,7 +816,7 @@ Nanite 通过 `OppositeCorner` 去找左侧或右侧候选邻接旧三角形去�
     uint32 NumNewVertices = VisitTriangle(Context, CurrentCorner, false, bIsRight);
     // 确保最多只会新增 1 个新顶点
     check(NumNewVertices <= 1u);
-    // 如果第 3 个顶点也是 ref 顶点, 则写此 ref 顶点的 5 bits 相对距离
+    // 如果第 3 个顶点也是 ref 顶点, 则写此 ref 顶点的 5-bit 相对距离
     if (NumNewVertices == 0)
     {
         uint32 Index = Context.OldToNewVertex[Cluster.Indexes[CornerToIndex(CurrentCorner)]];
@@ -856,14 +856,14 @@ void Flush(uint32 Alignment=1)
 然后根据 stripify 后的数据重建 cluster 的顶点数据 `Verts`：
 
 ```cpp
-// 最终 strip 编码产生的新顶点数量, 它可能大于旧顶点数，因为超过 5 bits 约束的 ref 顶点会重新作为新顶点编码
+// 最终 strip 编码产生的新顶点数量, 它可能大于旧顶点数，因为超过 5-bit 约束的 ref 顶点会重新作为新顶点编码
 const uint32 NumNewVertices = Context.NumVertices;
 
 // 把原来的顶点数组拷贝到 OldVertices, 并清空 Cluster.Verts
 FVertexArray OldVertices( Cluster.Verts.Format );
 Swap( OldVertices, Cluster.Verts );
 
-// 按 NewToOldVertex 映射重建 Cluster.Verts: 如果某个旧顶点因为 5 bits 偏移约束被重新作为新顶点编码，那么 NewToOldVertex 中会有多个新索引指向同一个旧顶点；这里会复制相同的 vertex attribute 到多个位置
+// 按 NewToOldVertex 映射重建 Cluster.Verts: 如果某个旧顶点因为 5-bit 偏移约束被重新作为新顶点编码，那么 NewToOldVertex 中会有多个新索引指向同一个旧顶点；这里会复制相同的 vertex attribute 到多个位置
 Cluster.Verts.Reserve( NumNewVertices );
 for( uint32 i = 0; i < NumNewVertices; i++ )
 {
@@ -874,7 +874,7 @@ for( uint32 i = 0; i < NumNewVertices; i++ )
 check( Context.NumTriangles == NumOldTriangles );
 ```
 
-因为在 stripify 的过程中，有些 ref 顶点会因为超出 5 bits 偏移约束从而被重新编码成一个新顶点，所以 `Context.NewToOldVertex` 中会存在多个索引指向同一个旧顶点的情况，这也导致最终 `Cluster.Verts` 中会存在多个相同的旧顶点。
+因为在 stripify 的过程中，有些 ref 顶点会因为超出 5-bit 偏移约束从而被重新编码输出成一个新顶点，所以 `Context.NewToOldVertex` 中会存在多个索引指向同一个旧顶点的情况，这也导致最终 `Cluster.Verts` 中会存在多个相同的旧顶点。
 
 重建完新的 `Cluster.Verts` 后，Nanite 会继续写入用于解码 `Cluster.StripIndexData` 数据的描述信息 `Cluster.StripDesc`：
 
@@ -914,13 +914,271 @@ FMemory::Memcpy(StripDesc.Bitmasks, Context.StripBitmasks, sizeof(StripDesc.Bitm
 
 其中，`NumPrevNewVerticesBeforeDwords` 从最低位开始，每 10 bits 存储一个 DWORD **之前累计的**新顶点数：由于 DWORD 0 之前的累计值必然为 0，因此不会显式存储；bits `[0, 9]` 记录 DWORD 1 之前的累计新顶点数，也就是 DWORD 0 内所有三角形新增的新顶点数；bits `[10, 19]` 记录 DWORD 2 之前的累计新增顶点数，也就是 DWORD 0 和 DWORD 1 内所有三角形新增的新顶点数；bits `[20, 29]` 记录 DWORD 3 之前的累计新增顶点数。类似的，`NumPrevRefVerticesBeforeDwords` 则是从最低位开始，每 10 bits 存储一个 DWORD 之前累计的 ref 顶点数。
 
-`Bitmasks` 中，`TriangleIndex >> 5` 可以定位三角形所属的 DWORD，通过 `TriangleIndex & 31` 可以定位该三角形在对应 DWORD 内的 bit 为。每组 `Bitmasks` 包含 3 个 `uint32`，这 3 个 `uint32` 中相同 bit 位共同描述一个三角形的 strip 编码信息。
+`Bitmasks` 中，`TriangleIndex >> 5` 可以定位三角形所属的 DWORD，通过 `TriangleIndex & 31` 可以定位该三角形在对应 DWORD 内的 bit 位。每组 `Bitmasks` 包含 3 个 `uint32`，这 3 个 `uint32` 中相同 bit 位共同描述一个三角形的 strip 编码信息。
 
 `Bitmasks[][0]` 的对应 bit 表示某个三角形是否为 strip 起点，若该 bit 为 1，则表示该三角形是 strip 起点，此时 `Bitmasks[][1]` 和 `Bitmasks[][2]` 的对应 bit 组合表示该起点三角形中的 ref 顶点数量，范围为 `0..3`，其中 `Bitmasks[][1]` 为高位，`Bitmasks[][2]` 为低位。
 
 若该三角形不是 strip 起点，则表示它是一个 strip 的延伸三角形。此时 `Bitmasks[][1]` 的对应 bit 表示该三角形是左侧还是右侧延伸，`Bitmasks[][2]` 的对应 bit 表示新引入的 head 顶点是否为 ref 顶点。
 
-**需要注意的是**：`Bitmasks` 本身只描述每个三角形的 strip 结构和 ref 顶点或新顶点分布，并不直接存储 ref 顶点的具体索引。具体的 ref 顶点索引以 5 bits 偏移的形式存储在 `Cluster.StripIndexData` 中。解码时会结合 `Bitmasks`、`NumPrevNewVerticesBeforeDwords`、`NumPrevRefVerticesBeforeDwords` 以及当前 DWORD 内之前三角形的 bit 计数，计算出当前三角形的新顶点基准位置 `BaseVertex`，以及需要从 `Cluster.StripIndexData` 读取的 bit offset，随后读取对应的 5 bits 相对偏移，从而还原完整的三角形索引。
+**需要注意的是**：`Bitmasks` 本身只描述每个三角形的 strip 结构和 ref 顶点或新顶点分布，并不直接存储 ref 顶点的具体索引。具体的 ref 顶点索引以 5-bit 偏移的形式存储在 `Cluster.StripIndexData` 中。解码时会结合 `Bitmasks`、`NumPrevNewVerticesBeforeDwords`、`NumPrevRefVerticesBeforeDwords` 以及当前 DWORD 内之前三角形的 bit 计数，计算出当前三角形的新顶点基准位置 `BaseVertex`，以及需要从 `Cluster.StripIndexData` 读取的 bit offset，随后读取对应的 5-bit 相对偏移，从而还原完整的三角形索引。
+
+写完 `Cluster.StripDesc` 之后，Nanite 会立刻用刚生成的 strip 编码数据反解一遍三角形索引，并用反解结果重建 `Cluster.Indexes`。这里的 `Indexes` 已经不再引用 stripify 前的旧顶点数组，而是引用上面刚按 `Context.NewToOldVertex` 重建出来的新 `Cluster.Verts`。
+
+这个反解过程的核心逻辑在 `UnpackTriangleIndices()` 方法中。它会以输出后的三角形序号 `TriIndex` 为输入，根据 `StripDesc.Bitmasks` 判断当前三角形是 strip 起点还是 strip 延伸三角形，再结合 `NumPrevNewVerticesBeforeDwords`、`NumPrevRefVerticesBeforeDwords` 和当前 DWORD 内的 bit 计数，算出当前三角形之前已经输出过多少个新顶点和 ref 顶点。之后再从 `StripIndexData` 中读取对应的 5-bit ref 偏移，最终还原当前三角形的 3 个新顶点序列索引，并写入 `Cluster.Indexes`。
+
+源码中还有一个小细节：`UnpackTriangleIndices()` 和 GPU 侧实现保持 1:1，为了减少分支，它可能会多读一些最终不会使用的 index data。因此 CPU 侧在调用前会给 `Cluster.StripIndexData` 前面补 1 个字节、后面补若干 0，保证 `ReadUnalignedDword()` 做非对齐 DWORD 读取时不会越界：
+
+```cpp
+const uint32 PaddedSize = Cluster.StripIndexData.Num() + 5;
+TArray<uint8> PaddedStripIndexData;
+PaddedStripIndexData.Reserve( PaddedSize );
+
+PaddedStripIndexData.Add( 0 );   // TODO: Workaround for empty list and reading from negative offset
+PaddedStripIndexData.Append( Cluster.StripIndexData );
+
+// UnpackTriangleIndices is 1:1 with the GPU implementation.
+// It can end up over-fetching because it is branchless. The over-fetched data is never actually used.
+// On the GPU index data is followed by other page data, so it is safe.
+
+// Here we have to pad to make it safe to perform a DWORD read after the end.
+PaddedStripIndexData.SetNumZeroed( PaddedSize );
+
+// Unpack strip
+for( uint32 i = 0; i < NumOldTriangles; i++ )
+{
+    UnpackTriangleIndices( StripDesc, (const uint8*)(PaddedStripIndexData.GetData() + 1), i, &Cluster.Indexes[ i * 3 ] );
+}
+```
+
+```cpp
+static void UnpackTriangleIndices( const FStripDesc& StripDesc, const uint8* StripIndexData, uint32 TriIndex, uint32* OutIndices )
+{
+    // 当前三角形属于第几个 32-triangle DWORD
+    const uint32 DwordIndex = TriIndex >> 5;
+    // 当前三角形在 DWORD 内的 bit 位置
+    const uint32 BitIndex = TriIndex & 31u;
+
+    // SMask: 某个三角形在 SMask 中对应 bit 位为 1 则表示该三角形是 strip 起点
+    const uint32 SMask = StripDesc.Bitmasks[ DwordIndex ][ 0 ];
+    // LMask:
+    //   - 对于非 strip 起点三角形, 它表示的是该三角形是否是从左侧延伸扩展而来;
+    //   - 而对于 strip 起点三角形, 它表示的是该三角形 ref 顶点数的高位 (与 WMask 中的低位组合成 2 bits 记录 strip 起点三角形的 ref 顶点数);
+    const uint32 LMask = StripDesc.Bitmasks[ DwordIndex ][ 1 ];
+    // WMask:
+    //   - 对于非 strip 起点三角形, 它表示该三角形新引入的那个顶点是否是 ref 顶点;
+    //   - 而对于 strip 起点三角形, 它表示的是该三角形 ref 顶点数的低位 (与 LMask 中的高位组合成 2 bits 记录 strip 起点三角形的 ref 顶点数);
+    const uint32 WMask = StripDesc.Bitmasks[ DwordIndex ][ 2 ];
+    // SLMask: 某个三角形在 SLMask 中对应的 bit 位为 1 则表示该三角形既是 strip 起点并且其 ref 顶点数高位为 1, 也就是说该三角形的 ref 顶点数 >= 2
+    const uint32 SLMask = SMask & LMask;
+    
+    //const uint HeadRefVertexMask = ( SMask & LMask & WMask ) | ( ~SMask & WMask );
+    // 上面注释是下面代码的展开版本
+    // HeadRefVertexMask: 某个三角形的 head 顶点是否是 ref 顶点, 有以下两种情况:
+    //   - 对于非 strip 起点三角形, 它的 head 顶点是 ref 顶点则表示此三角形新引入的那个顶点是 ref 顶点, 也就是 WMask = 1;
+    //   - 而对于 strip 起点三角形, 它的 head 顶点是 ref 顶点则表示此三角形的 3 个顶点全部都是 ref 顶点, 也就是 ref 顶点数为 3;
+    const uint32 HeadRefVertexMask = ( SLMask | ~SMask ) & WMask;   // 1 if head of triangle is ref. S case with 3 refs or L/R case with 1 ref.
+
+    // PrevBitsMask: 当前 32-triangle DWORD 内, 当前三角形之前所有的三角形的 bit mask
+    const uint32 PrevBitsMask = ( 1u << BitIndex ) - 1u;
+    // 当前 32-triangle DWORD 之前累计的 ref 顶点数
+    const uint32 NumPrevRefVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevRefVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
+    // 当前 32-triangle DWORD 之前累计的新顶点数
+    const uint32 NumPrevNewVerticesBeforeDword = DwordIndex ? BitFieldExtractU32(StripDesc.NumPrevNewVerticesBeforeDwords, 10u, DwordIndex * 10u - 10u) : 0u;
+
+    // 在当前 32-triangle DWORD 内当前三角形之前累计的 ref 顶点数, 其中:
+    //   - ( FMath::CountBits( SLMask & PrevBitsMask ) << 1 ) : 累计 strip 起点三角形 ref 顶点数的高位贡献, 因为是高位所以会左移 1 位乘以 2;
+    //   - FMath::CountBits( WMask & PrevBitsMask ) : 累计 strip 起点三角形 ref 顶点数的低位贡献, 以及延伸三角形新引入顶点为 ref 顶点时的贡献;
+    int32 CurrentDwordNumPrevRefVertices = ( FMath::CountBits( SLMask & PrevBitsMask ) << 1 ) + FMath::CountBits( WMask & PrevBitsMask );
+    // 在当前 32-triangle DWORD 内当前三角形之前累计的新顶点数, 其中:
+    //   - 首先我们知道: 对于 strip 起点三角形最多有 3 个新顶点; 而对于非 strip 起点三角形, 最多有 1 个新顶点, 所以:
+    //     1. BitIndex                                          -> 表示当前三角形之前的每个三角形先按 1 个新顶点算
+    //     2. ( FMath::CountBits( SMask & PrevBitsMask ) << 1 ) -> 然后再给每个 strip 起点三角形补 2 个新顶点
+    //     3. 最后再减去累计的 ref 顶点数, 最终得到当前三角形之前累计的新顶点数
+    int32 CurrentDwordNumPrevNewVertices = ( FMath::CountBits( SMask & PrevBitsMask ) << 1 ) + BitIndex - CurrentDwordNumPrevRefVertices;
+
+    // 当前三角形之前累计的总的 ref 顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的 ref 顶点数 以及 当前 32-triangle DWORD 内当前三角形之前累计的 ref 顶点数
+    int32 NumPrevRefVertices    = NumPrevRefVerticesBeforeDword + CurrentDwordNumPrevRefVertices;
+    // 当前三角形之前累计的总的新顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的新顶点数 以及 当前 32-triangle DWORD 内当前三角形之前累计的新顶点数
+    int32 NumPrevNewVertices    = NumPrevNewVerticesBeforeDword + CurrentDwordNumPrevNewVertices;
+
+    // 当前三角形是否是 strip 起点三角形
+    const int32 IsStart = BitFieldExtractI32( SMask, 1, BitIndex);      // -1: true, 0: false
+    // 当前三角形的 LMask bit
+    const int32 IsLeft  = BitFieldExtractI32( LMask, 1, BitIndex );     // -1: true, 0: false
+    // 当前三角形的 WMask bit
+    const int32 IsRef   = BitFieldExtractI32( WMask, 1, BitIndex );     // -1: true, 0: false
+
+    // BaseVertex 是: 当前三角形之前, 最后一个输出的新顶点序列索引, 也就是最近新顶点的索引
+    // 而 ref 顶点的 5-bit delta 编码的是: 被引用顶点相对 BaseVertex 的距离
+    // 所以这里先算出最近新顶点的索引 BaseVertex
+    const uint32 BaseVertex = NumPrevNewVertices - 1u;
+
+    // StripIndexData 里每个 ref 顶点占 5-bit, 对于 strip 起点三角形, 它的第一个 ref 顶点的 5-bit delta 从 NumPrevRefVertices * 5 开始读
+    /*
+        因为 ～(-1) = 0, ~(0) = -1, 也就是说 ( NumPrevRefVertices + ~IsStart ) * 5 等价于:
+
+        if (IsStart)
+        {
+            readOffset = NumPrevRefVertices * 5;
+        }
+        else
+        {
+            readOffset = ( NumPrevRefVertices - 1 ) * 5;
+        }
+    */
+    // 对非 strip 起点三角形进行解码时, 可能不仅需要当前三角形自己的 head/ref delta, 还可能需要前一个三角形的 head/ref delta 来恢复共享边上的顶点, 所以这里会额外往前读一个 5-bit delta
+    uint32 IndexData = ReadUnalignedDword( StripIndexData, ( NumPrevRefVertices + ~IsStart ) * 5 ); // -1 if not Start
+
+    // 当前三角形是 strip 起点三角形, strip 起点三角形的 3 个顶点都要独立计算
+    if( IsStart )
+    {
+        // 因为 IsLeft 和 IsRef 的值是 -1: true, 0: false
+        // 所以这里是负数形式的 ref 顶点数量
+        // 0/1/2/3 个 ref 顶点分别对应的 MinusNumRefVertices 值是 0/-1/-2/-3
+        const int32 MinusNumRefVertices = ( IsLeft << 1 ) + IsRef;
+
+        // 下一个可分配的新顶点序列索引
+        uint32 NextVertex = NumPrevNewVertices;
+
+        // 如果至少有 1 个 ref 顶点, 解码 OutIndices[ 0 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到新顶点序列索引; 否则 OutIndices[ 0 ] 是一个新顶点, 分配下一个可分配的新顶点序列索引, 然后 NextVertex++
+        if( MinusNumRefVertices <= -1 ) { OutIndices[ 0 ] = BaseVertex - ( IndexData & 31u ); IndexData >>= 5; } else { OutIndices[ 0 ] = NextVertex++; }
+        // 至少有 2 个 ref 顶点, 继续解码 OutIndices[ 1 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到新顶点序列索引; 否则 OutIndices[ 1 ] 是一个新顶点, 分配下一个可分配的新顶点序列索引, 然后 NextVertex++
+        if( MinusNumRefVertices <= -2 ) { OutIndices[ 1 ] = BaseVertex - ( IndexData & 31u ); IndexData >>= 5; } else { OutIndices[ 1 ] = NextVertex++; }
+        // 3 个顶点都是 ref 顶点, 继续解码 OutIndices[ 2 ], 从 IndexData 低 5 bit 取 delta, BaseVertex - delta 得到新顶点序列索引; 否则 OutIndices[ 2 ] 是一个新顶点, 分配下一个可分配的新顶点序列索引, 然后 NextVertex++
+        if( MinusNumRefVertices <= -3 ) { OutIndices[ 2 ] = BaseVertex - ( IndexData & 31u );                  } else { OutIndices[ 2 ] = NextVertex++; }
+    }
+    else
+    {
+        // 当前三角形是非 strip 起点三角形, 也就是说它是 strip 延伸扩展出来的, 它的前 2 个顶点来自已有边, 需要通过 strip 拓扑从前面的三角形推导出来
+
+        // 前一个三角形在当前 DWORD 内的 bit 位置
+        const uint32 PrevBitIndex = BitIndex - 1u;
+        // 前一个三角形是否是 strip 起点三角形
+        const int32 IsPrevStart = BitFieldExtractI32( SMask, 1, PrevBitIndex);
+        // 前一个三角形的 head 顶点是否是 ref 顶点
+        const int32 IsPrevHeadRef = BitFieldExtractI32( HeadRefVertexMask, 1, PrevBitIndex );
+        //const int NumPrevNewVerticesInTriangle = IsPrevStart ? ( 3u - ( bfe_u32( /*SLMask*/ LMask, PrevBitIndex, 1 ) << 1 ) - bfe_u32( /*SMask &*/ WMask, PrevBitIndex, 1 ) ) : /*1u - IsPrevRefVertex*/ 0u;
+        // 如果前一个三角形是 strip 起点, 计算它输出了多少个新顶点; 如果前一个三角形是 strip 延伸三角形, 这里不需要做起点三角形的偏移修正, 值为 0
+        const int32 NumPrevNewVerticesInTriangle = IsPrevStart & ( 3u - ( (BitFieldExtractU32( /*SLMask*/ LMask, 1, PrevBitIndex) << 1 ) | BitFieldExtractU32( /*SMask &*/ WMask, 1, PrevBitIndex) ) );
+        
+        //OutIndices[ 1 ] = IsPrevRefVertex ? ( BaseVertex - ( IndexData & 31u ) + NumPrevNewVerticesInTriangle ) : BaseVertex; // BaseVertex = ( NumPrevNewVertices - 1 );
+        // 解码 OutIndices[ 1 ]:
+        //   - 如果前一个三角形的 head 顶点是 ref 顶点, 则用 ( IndexData & 31u ) 取前一个 ref delta, 再加上 NumPrevNewVerticesInTriangle 做前一个三角形是 strip 起点情况的偏移修正
+        //   - 如果前一个三角形的 head 顶点不是 ref 顶点, 则直接使用 BaseVertex
+        OutIndices[ 1 ] = BaseVertex + ( IsPrevHeadRef & ( NumPrevNewVerticesInTriangle - ( IndexData & 31u ) ) );
+        //OutIndices[ 2 ] = IsRefVertex ? ( BaseVertex - bfe_u32( IndexData, 5, 5 ) ) : NumPrevNewVertices;
+        // 解码 OutIndices[ 2 ]:
+        //   - 如果当前三角形的 head 顶点是 ref 顶点, 则用 IndexData 的第 2 个 5-bit delta 解码出其新顶点序列索引
+        //   - 如果当前三角形的 head 顶点不是 ref 顶点, 则它就是当前三角形新引入的新顶点, 索引为 NumPrevNewVertices
+        OutIndices[ 2 ] = NumPrevNewVertices + ( IsRef & ( -1 - BitFieldExtractU32( IndexData, 5, 5 ) ) );
+
+        // We have to search for the third vertex. 
+        // Left triangles search for previous Right/Start. Right triangles search for previous Left/Start.
+
+        // 解码 OutIndices[ 0 ]: 如果是左扩展, 则要找之前最近的右扩展或者 strip 起点三角形; 如果是右扩展, 则需要找之前最近的左扩展或 strip 起点三角形;
+
+        // SMask | ( LMask ^ IsLeft ):
+        //   - SMask: 保证 strip 起点三角形总是候选;
+        //   - ( LMask ^ IsLeft ): 如果当前三角形是左扩展, LMask ^ (-1) = ~LMask, 找右扩展; 如果当前三角形是右扩展, LMask ^ 0 = LMask, 找左扩展
+        const uint32 SearchMask = SMask | ( LMask ^ IsLeft );               // SMask | ( IsRight ? LMask : RMask );
+
+        // 当前三角形之前的候选里找最高 bit 位代表的三角形, 也就是离当前三角形最近的候选三角形
+        const uint32 FoundBitIndex = FMath::FloorLog2( SearchMask & PrevBitsMask );
+        // 这个候选三角形是不是 strip 起点三角形
+        const int32 IsFoundCaseS = BitFieldExtractI32( SMask, 1, FoundBitIndex );       // -1: true, 0: false
+
+        // 当前 32-triangle DWORD 内, 这个候选三角形之前所有的三角形的 bit mask
+        const uint32 FoundPrevBitsMask = ( 1u << FoundBitIndex ) - 1u;
+        // 在当前 32-triangle DWORD 内候选三角形之前累计的 ref 顶点数
+        int32 FoundCurrentDwordNumPrevRefVertices = ( FMath::CountBits( SLMask & FoundPrevBitsMask ) << 1 ) + FMath::CountBits( WMask & FoundPrevBitsMask );
+        // 在当前 32-triangle DWORD 内候选三角形之前累计的新顶点数
+        int32 FoundCurrentDwordNumPrevNewVertices = ( FMath::CountBits( SMask & FoundPrevBitsMask ) << 1 ) + FoundBitIndex - FoundCurrentDwordNumPrevRefVertices;
+
+        // 候选三角形之前累计的总的新顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的新顶点数 以及 当前 32-triangle DWORD 内候选三角形之前累计的新顶点数
+        int32 FoundNumPrevNewVertices = NumPrevNewVerticesBeforeDword + FoundCurrentDwordNumPrevNewVertices;
+        // 候选三角形之前累计的总的 ref 顶点数, 这个数量包括: 当前 32-triangle DWORD 之前累计的 ref 顶点数 以及 当前 32-triangle DWORD 内候选三角形之前累计的 ref 顶点数
+        int32 FoundNumPrevRefVertices = NumPrevRefVerticesBeforeDword + FoundCurrentDwordNumPrevRefVertices;
+
+        // 如果候选三角形是 strip 起点, 这里表示候选三角形的 ref 顶点数量; 如果候选三角形不是 strip 起点, 这个值不按 ref 顶点数量来解释
+        const uint32 FoundNumRefVertices = (BitFieldExtractU32( LMask, 1, FoundBitIndex ) << 1 ) + BitFieldExtractU32( WMask, 1, FoundBitIndex );
+        // 候选三角形的前一个输出三角形的 head 顶点是否是 ref 顶点
+        const uint32 IsBeforeFoundRefVertex = BitFieldExtractU32( HeadRefVertexMask, 1, FoundBitIndex - 1 );
+
+        // ReadOffset: Where is the vertex relative to triangle we searched for?
+        // 读取候选三角形的 5-bit delta 时的偏移:
+        //   - 如果候选三角形是 strip 起点且当前三角形是左扩展, 则要读候选三角形的第 2 个 5-bit delta, 所以 ReadOffset = -1, 后续 ( FoundNumPrevRefVertices - ReadOffset ) 也就是 ( FoundNumPrevRefVertices + 1 );
+        //   - 如果候选三角形是 strip 起点且当前三角形是右扩展, 则读第 1 个 5-bit delta, 所以 ReadOffset = 0;
+        //   - 如果候选三角形不是 strip 起点, 则读候选三角形前一个 5-bit delta, 所以 ReadOffset = 1;
+        const int32 ReadOffset = IsFoundCaseS ? IsLeft : 1;
+        const uint32 FoundIndexData = ReadUnalignedDword( StripIndexData, ( FoundNumPrevRefVertices - ReadOffset ) * 5 );
+
+        // ( FoundNumPrevNewVertices - 1u ): 是 FoundBaseVertex
+        // BitFieldExtractU32( FoundIndexData, 5, 0 ): 是 5-bit delta
+        // 解码候选三角形中被当前三角形复用的那个 ref 顶点的新顶点序列索引
+        const uint32 FoundIndex = ( FoundNumPrevNewVertices - 1u ) - BitFieldExtractU32( FoundIndexData, 5, 0 );
+
+        // 决定是否应该使用 FoundIndex
+        // 如果候选三角形是 strip 起点, 则:
+        //   - 如果当前三角形是右扩展, 则候选三角形至少要有 1 个 ref 顶点;
+        //   - 如果当前三角形是左扩展, 则候选三角形至少要有 2 个 ref 顶点;
+        // 而如果候选三角形不是 strip 起点, 则候选三角形的前一个三角形的 head 顶点必须是 ref 顶点
+        bool bCondition = IsFoundCaseS ? ( (int32)FoundNumRefVertices >= 1 - IsLeft ) : (IsBeforeFoundRefVertex != 0u);
+        // 如果不能用 FoundIndex, 那么应该使用哪个可由 strip 拓扑推导出来的新顶点序列索引:
+        //   - 候选三角形是 strip 起点并且没有 ref 顶点时:
+        //     - 当前三角形是右扩展, 新顶点序列索引是: FoundNumPrevNewVertices;
+        //     - 当前三角形是左扩展, 新顶点序列索引是: FoundNumPrevNewVertices + 1;
+        //   - 候选三角形是 strip 起点但有 ref 顶点时, 新顶点序列索引是: FoundNumPrevNewVertices;
+        //   - 候选三角形不是 strip 起点, 新顶点序列索引是: FoundNumPrevNewVertices - 1;
+        int32 FoundNewVertex = FoundNumPrevNewVertices + ( IsFoundCaseS ? ( IsLeft & ( FoundNumRefVertices == 0 ) ) : -1 );
+        // 满足条件就使用 FoundIndex, 否则使用推导的新顶点 FoundNewVertex
+        OutIndices[ 0 ] = bCondition ? FoundIndex : FoundNewVertex;
+
+        // 如果当前三角形是左扩展, 那么前面解码出来的第 2, 3 个顶点的顺序需要反过来, 这样才能恢复正确的三角形顶点排列
+        if( IsLeft )
+        {
+            // swap
+            std::swap( OutIndices[ 1 ], OutIndices[ 2 ] );
+        }
+        check(OutIndices[0] != OutIndices[1] && OutIndices[0] != OutIndices[2] && OutIndices[1] != OutIndices[2]);
+    }
+}
+```
+
+简单总结一下 `UnpackTriangleIndices()` 的反解逻辑：
+
+1. 对于 strip 起点三角形，`LMask/WMask` 组合记录的是这个起点三角形有多少个 ref 顶点。ref 顶点从 `StripIndexData` 中读取 5-bit delta，并用 `BaseVertex - delta` 还原为新顶点序列索引；剩下的顶点则按 `NumPrevNewVertices` 开始顺序分配为新顶点。
+2. 对于 strip 延伸三角形，`LMask` 记录延伸方向，`WMask` 记录新引入的 head 顶点是否为 ref 顶点。它的其中两个顶点来自 strip 共享边：一个可以从前一个输出三角形的 head 顶点推导出来，另一个需要根据当前三角形的延伸方向，向前找到最近的反方向延伸三角形或者 strip 起点三角形再推导出来。最后如果当前三角形是左扩展，还需要交换 `OutIndices[1]` 和 `OutIndices[2]`，恢复正确的三角形绕序。
+
+因此，stripify 之后 `Cluster.StripDesc` 和 `Cluster.StripIndexData` 是运行时真正用于解码三角形拓扑的紧凑表示，而这里重建出来的 `Cluster.Indexes` 更像是 CPU 侧的校验和后续构建流程需要的普通 index buffer 视图：它与运行时解码结果保持一致，并且引用的是 stripify 后的新 `Cluster.Verts`。
+
+因为在 stripify 的过程中，有些 ref 顶点会因为超出 5-bit 偏移约束从而被重新编码输出成一个新顶点，也就是说 stripify 之后的顶点数可能会变多，所以 Nanite 最后还会检查 stripify 之后 cluster 的顶点数量是否超过 `NANITE_MAX_CLUSTER_VERTICES` 限制，对于超过限制的 cluster，Nanite 会先将其按三角形数量二分，然后分别对拆分后的 cluster 再次按材质排序分段三角形以及 stripify 的处理，具体逻辑在 `BuildClusterFromClusterTriangleRange()` 方法中：
+
+```cpp
+const uint32 NumOldClusters = Clusters.Num();
+for( uint32 i = 0; i < NumOldClusters; i++ )
+{
+    TotalNewTriangles += Clusters[ i ].NumTris;
+    TotalNewVertices += Clusters[ i ].Verts.Num();
+    
+    // Stripify 后 cluster 的顶点数量超过 NANITE_MAX_CLUSTER_VERTICES 限制
+    if( Clusters[ i ].Verts.Num() > NANITE_MAX_CLUSTER_VERTICES && Clusters[i].NumTris )
+    {
+        FCluster ClusterA, ClusterB;
+        // 按三角形数量二分
+        uint32 NumTrianglesA = Clusters[ i ].NumTris / 2;
+        uint32 NumTrianglesB = Clusters[ i ].NumTris - NumTrianglesA;
+        // 对二分后的 2 个子 cluster 继续进行按材质排序分段三角形和 stripify 的处理
+        BuildClusterFromClusterTriangleRange( Clusters[ i ], ClusterA, 0, NumTrianglesA );
+        BuildClusterFromClusterTriangleRange( Clusters[ i ], ClusterB, NumTrianglesA, NumTrianglesB );
+        // ClusterA 替代原 cluster
+        Clusters[ i ] = ClusterA;
+        // ASSEMBLYTODO Many groups might reference this cluster.
+        // 将 ClusterB 添加到 Clusters 数组中, 并且将其在 Clusters 数组中的索引添加到原 cluster 所在的 group 中
+        ClusterGroups[ ClusterB.GroupIndex ].Children.Add( FClusterRef( Clusters.Num() ) );
+        Clusters.Add( ClusterB );
+    }
+}
+```
 
 ## 2. 编码 Cluster DAG
 
