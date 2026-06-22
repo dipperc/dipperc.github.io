@@ -910,7 +910,17 @@ static_assert(sizeof(StripDesc.Bitmasks) == sizeof(Context.StripBitmasks), "");
 FMemory::Memcpy(StripDesc.Bitmasks, Context.StripBitmasks, sizeof(StripDesc.Bitmasks));
 ```
 
-在 `Cluster.StripDesc` 中，`Bitmasks` 记录每个三角形的 strip 编码元数据，而 `NumPrevNewVerticesBeforeDwords` 和 `NumPrevRefVerticesBeforeDwords` 则是记录每个 32-triangle DWORD 之前累计的新顶点数和 ref 顶点数。
+在 `Cluster.StripDesc` 中，`Bitmasks` 以 32 个三角形为一组记录每个三角形的 strip 编码元数据；`NumPrevNewVerticesBeforeDwords` 和 `NumPrevRefVerticesBeforeDwords` 则分别记录每个 32-triangle DWORD 之前累计的新顶点数和 ref 顶点数。
+
+其中，`NumPrevNewVerticesBeforeDwords` 从最低位开始，每 10 bits 存储一个 DWORD **之前累计的**新顶点数：由于 DWORD 0 之前的累计值必然为 0，因此不会显式存储；bits `[0, 9]` 记录 DWORD 1 之前的累计新顶点数，也就是 DWORD 0 内所有三角形新增的新顶点数；bits `[10, 19]` 记录 DWORD 2 之前的累计新增顶点数，也就是 DWORD 0 和 DWORD 1 内所有三角形新增的新顶点数；bits `[20, 29]` 记录 DWORD 3 之前的累计新增顶点数。类似的，`NumPrevRefVerticesBeforeDwords` 则是从最低位开始，每 10 bits 存储一个 DWORD 之前累计的 ref 顶点数。
+
+`Bitmasks` 中，`TriangleIndex >> 5` 可以定位三角形所属的 DWORD，通过 `TriangleIndex & 31` 可以定位该三角形在对应 DWORD 内的 bit 为。每组 `Bitmasks` 包含 3 个 `uint32`，这 3 个 `uint32` 中相同 bit 位共同描述一个三角形的 strip 编码信息。
+
+`Bitmasks[][0]` 的对应 bit 表示某个三角形是否为 strip 起点，若该 bit 为 1，则表示该三角形是 strip 起点，此时 `Bitmasks[][1]` 和 `Bitmasks[][2]` 的对应 bit 组合表示该起点三角形中的 ref 顶点数量，范围为 `0..3`，其中 `Bitmasks[][1]` 为高位，`Bitmasks[][2]` 为低位。
+
+若该三角形不是 strip 起点，则表示它是一个 strip 的延伸三角形。此时 `Bitmasks[][1]` 的对应 bit 表示该三角形是左侧还是右侧延伸，`Bitmasks[][2]` 的对应 bit 表示新引入的 head 顶点是否为 ref 顶点。
+
+**需要注意的是**：`Bitmasks` 本身只描述每个三角形的 strip 结构和 ref 顶点或新顶点分布，并不直接存储 ref 顶点的具体索引。具体的 ref 顶点索引以 5 bits 偏移的形式存储在 `Cluster.StripIndexData` 中。解码时会结合 `Bitmasks`、`NumPrevNewVerticesBeforeDwords`、`NumPrevRefVerticesBeforeDwords` 以及当前 DWORD 内之前三角形的 bit 计数，计算出当前三角形的新顶点基准位置 `BaseVertex`，以及需要从 `Cluster.StripIndexData` 读取的 bit offset，随后读取对应的 5 bits 相对偏移，从而还原完整的三角形索引。
 
 ## 2. 编码 Cluster DAG
 
