@@ -7,9 +7,10 @@ category: Unreal Engine
 
 - [1. 准备编码数据](#1-准备编码数据)
   - [1.1. 清理非法属性值以及删除退化三角形](#11-清理非法属性值以及删除退化三角形)
-  - [1.2. 按材质重排序 Cluster 内的三角形](#12-按材质重排序-cluster-内的三角形)
+  - [1.2. 按材质重新排序 Cluster 内的三角形](#12-按材质重新排序-cluster-内的三角形)
   - [1.3. **Stripify** Cluster](#13-stripify-cluster)
-  - [1.4. Build Batches](#14-build-batches)
+  - [1.4. 为每个材质段切分 Batches](#14-为每个材质段切分-batches)
+  - [1.5.](#15)
 - [2. 编码 Cluster DAG](#2-编码-cluster-dag)
 - [2. References](#2-references)
 
@@ -42,7 +43,7 @@ Nanite 首先会清理 cluster 中的非法顶点属性，避免 NaN 或者越�
 }
 ```
 
-### 1.2. 按材质重排序 Cluster 内的三角形
+### 1.2. 按材质重新排序 Cluster 内的三角形
 
 Nanite 还会把每个 cluster 内的三角形**按材质重新排序**，最终使得 cluster 内**使用相同材质的三角形会被排序在一起，从而形成连续的区间，并且所在材质区间越大的三角形排的越靠前**。
 
@@ -1177,9 +1178,89 @@ for( uint32 i = 0; i < NumOldClusters; i++ )
 }
 ```
 
-### 1.4. Build Batches
+### 1.4. 为每个材质段切分 Batches
 
+Nanite 下一步会给每个 cluster 的每个材质段连续区间，按**最多 32 个唯一顶点、最多 32 个三角形**的限制切成若干 batch，并把每个 batch 包含的三角形数量写进 `Cluster.MaterialRange.BatchTriCounts` 中：
 
+```cpp
+static void BuildVertReuseBatches(FCluster& Cluster)
+{
+    // 逐个处理 cluster 内的每个材质段连续区间
+    for (FMaterialRange& MaterialRange : Cluster.MaterialRanges)
+    {
+        // 当前材质段内已经出现过的顶点集合, 索引是 cluster 局部顶点索引
+        TStaticBitArray<NANITE_MAX_CLUSTER_VERTICES> UsedVertMask;
+        // 当前 batch 的唯一顶点数
+        uint32 NumUniqueVerts = 0;
+        // 当前 batch 的唯一三角形数
+        uint32 NumTris = 0;
+        // 每个 batch 最多 32 个唯一顶点
+        const uint32 MaxBatchVerts = 32;
+        // 每个 batch 最多 32 个三角形
+        const uint32 MaxBatchTris = 32;
+        // 当前材质段末尾三角形索引
+        const uint32 TriIndexEnd = MaterialRange.RangeStart + MaterialRange.RangeLength;
+
+        // 清空旧的分 batches 结果
+        MaterialRange.BatchTriCounts.Reset();
+
+        // 遍历当前材质段连续区间里的所有三角形
+        for (uint32 TriIndex = MaterialRange.RangeStart; TriIndex < TriIndexEnd; ++TriIndex)
+        {
+            // 当前三角形的 3 个顶点索引
+            const uint32 VertIndex0 = Cluster.Indexes[TriIndex * 3 + 0];
+            const uint32 VertIndex1 = Cluster.Indexes[TriIndex * 3 + 1];
+            const uint32 VertIndex2 = Cluster.Indexes[TriIndex * 3 + 2];
+
+            // 当前 batch 中这 3 个顶点对应的 bit 位标记, 需要注意的是这里的 Bit0/Bit1/Bit2 是引用, 后续会直接赋值
+            auto Bit0 = UsedVertMask[VertIndex0];
+            auto Bit1 = UsedVertMask[VertIndex1];
+            auto Bit2 = UsedVertMask[VertIndex2];
+
+            // 先检查如果添加此三角形后, 当前 batch 的唯一顶点数是否超过限制的 32
+            const uint32 NumNewUniqueVerts = uint32(!Bit0) + uint32(!Bit1) + uint32(!Bit2);
+            if (NumUniqueVerts + NumNewUniqueVerts > MaxBatchVerts)
+            {
+                check(NumTris > 0);
+                // 记录当前 batch 的三角形数量
+                MaterialRange.BatchTriCounts.Add(uint8(NumTris));
+                // 重置 batch 状态, 准备开启新 batch
+                NumUniqueVerts = 0;
+                NumTris = 0;
+                UsedVertMask = TStaticBitArray<NANITE_MAX_CLUSTER_VERTICES>();
+                --TriIndex;
+                continue;
+            }
+
+            // 将此三角形添加进当前 batch, 并将其 3 个顶点标记为已使用
+            Bit0 = true;
+            Bit1 = true;
+            Bit2 = true;
+            NumUniqueVerts += NumNewUniqueVerts;
+            ++NumTris;
+
+            // 检查当前 batch 的三角形数量是否达到限制的 32
+            if (NumTris == MaxBatchTris)
+            {
+                // 记录当前 batch 的三角形数量
+                MaterialRange.BatchTriCounts.Add(uint8(NumTris));
+                // 重置 batch 状态, 准备开启新 batch
+                NumUniqueVerts = 0;
+                NumTris = 0;
+                UsedVertMask = TStaticBitArray<NANITE_MAX_CLUSTER_VERTICES>();
+            }
+        }
+
+        // 记录最后一个还未满 32 个三角形的 batch
+        if (NumTris > 0)
+        {
+            MaterialRange.BatchTriCounts.Add(uint8(NumTris));
+        }
+    }
+}
+```
+
+### 1.5. 
 
 ## 2. 编码 Cluster DAG
 
