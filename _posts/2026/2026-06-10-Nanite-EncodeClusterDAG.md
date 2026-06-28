@@ -10,9 +10,11 @@ category: Unreal Engine
   - [1.2. 按材质重新排序 Cluster 内的三角形](#12-按材质重新排序-cluster-内的三角形)
   - [1.3. **Stripify** Cluster](#13-stripify-cluster)
   - [1.4. 为每个材质段切分 Batches](#14-为每个材质段切分-batches)
-  - [1.5.](#15)
+  - [1.5. 使用全局统一精度量化 Cluster 顶点 Position](#15-使用全局统一精度量化-cluster-顶点-position)
+  - [1.6. 量化 Cluster 顶点 BoneWeight](#16-量化-cluster-顶点-boneweight)
 - [2. 编码 Cluster DAG](#2-编码-cluster-dag)
-- [2. References](#2-references)
+  - [2.1. 计算 Cluster 编码信息](#21-计算-cluster-编码信息)
+- [3. References](#3-references)
 
 本篇笔记是 Unreal Engine 的 Nanite 系统中关于编码 Cluster DAG 数据的源码分析理解，基于引擎版本 5.7.3 release。
 
@@ -1260,11 +1262,381 @@ static void BuildVertReuseBatches(FCluster& Cluster)
 }
 ```
 
-### 1.5. 
+### 1.5. 使用全局统一精度量化 Cluster 顶点 Position
+
+在 cluster 完成约束、拆分以及 stripify 后，此时每个 cluster 的几何数据已经稳定，Nanite 会**给整个 Nanite 网格选择一个全局统一的 Position 量化精度 `PositionPrecision`**，然后把每个 cluster 的浮点型顶点 Position 量化成 cluster 局部整数偏移，并记录运行时解码需要的元数据。
+
+Nanite 首先会检查当前定义值并做一次最坏情况验证，验证 Nanite 定义的常量值组合本身是否是自洽的：
+
+```cpp
+// 计算顶点 Position 的每个轴最多能表示的局部量化值
+// 当前 NANITE_MAX_POSITION_QUANTIZATION_BITS = 21, 也就是说每个轴的局部量化值要用 21 bits 表示, 所以允许的最大值是 2^21 - 1
+const int32 MaxPositionQuantizedValue   = (1 << NANITE_MAX_POSITION_QUANTIZATION_BITS) - 1;
+
+// 最坏情况检查
+{
+    // Nanite 使用最大支持的坐标值 NANITE_MAX_COORDINATE_VALUE 和数值最小的 NANITE_MIN_POSITION_PRECISION 算出最大量化整数
+    const float MaxValue = FMath::RoundToFloat(NANITE_MAX_COORDINATE_VALUE * FMath::Exp2((float)NANITE_MIN_POSITION_PRECISION));
+    // MaxValue <= FLT_INT_MAX: 最大量化整数是否还能安全转成 int32
+    // int64(MaxValue) - int64(-MaxValue) <= MaxPositionQuantizedValue: 从负最大到正最大的跨度是否能被 21 bits 表示
+    checkf(MaxValue <= FLT_INT_MAX && int64(MaxValue) - int64(-MaxValue) <= MaxPositionQuantizedValue, TEXT("Largest cluster bounds doesn't fit in position bits"));
+}
+```
+
+然后是确定当前整个 Nanite 网格的全局统一量化精度，首先会取 `Settings.PositionPrecision` 中设置的量化精度，如果选择的是 Auto 模式，也就是 `Settings.PositionPrecision == MIN_int32`，那么 Nanite 会自动估算一个量化精度：
+
+```cpp
+// Settings 中设置的量化精度
+int32 PositionPrecision = Settings.PositionPrecision;
+
+// 如果选择了 Auto 模式, 则自动估算一个精度, 这里估算精度的逻辑是: 网格越密, 选择的精度应该越高
+if (PositionPrecision == MIN_int32)
+{
+    double TotalLogSize = 0.0;
+    int32 TotalNum = 0;
+    for (const FCluster& Cluster : Clusters)
+    {
+        // 用 MipLevel == 0 && NumTris != 0 的 cluster 来估算, 也就是只看最细 LOD 并且有三角形的 cluster
+        if (Cluster.MipLevel == 0 && Cluster.NumTris != 0)
+        {
+            // 取每个 cluster 的包围盒 extent 长度
+            float ExtentSize = Cluster.Bounds.GetExtent().Size();
+            if (ExtentSize > 0.0)
+            {
+                // 累加 log2(ExtentSize)
+                TotalLogSize += FMath::Log2(ExtentSize);
+                // 增加计数
+                TotalNum++;
+            }
+        }
+    }
+
+    // 平均 log2(ExtentSize)
+    double AvgLogSize = TotalNum > 0 ? TotalLogSize / TotalNum : 0.0;
+
+    // 根据平均 log2(ExtentSize) 计算全局统一量化精度:
+    //   - AvgLogSize 越小: 说明 cluster 平均尺寸小, 此时网格密集(更细), 需要使用更高的量化精度, 所以 PositionPrecision 越大
+    //   - AvgLogSize 越大: 说明 cluster 平均尺寸大, 此时网格稀疏(更粗), 可以用更低的量化精度, 所以 PositionPrecision 越小
+    PositionPrecision = 7 - (int32)FMath::RoundToInt(AvgLogSize);
+
+    
+    // 过低的量化精度容易在场景里出问题, 并且节省的磁盘体积很少, 所以 Nanite 在这里限制 Auto 模式下的最小量化精度
+    // Auto 模式下不会主动选比 1/16 cm 更低的精度
+    const int32 AUTO_MIN_PRECISION = 4; // 1/16cm
+    PositionPrecision = FMath::Max(PositionPrecision, AUTO_MIN_PRECISION);
+}
+
+// 无论是 Auto 模式自动估算还是指定了具体的量化精度, 最终都 clamp 到 Nanite 支持的范围
+PositionPrecision = FMath::Clamp(PositionPrecision, NANITE_MIN_POSITION_PRECISION, NANITE_MAX_POSITION_PRECISION);
+```
+
+Auto 模式下自动估算量化精度的核心逻辑是：统计所有最细 LOD 且有三角形的 cluster，并对每个 cluster 的包围盒 extent 长度取 `log2` 后求平均，用这个平均值来大致反映 cluster 的整体尺寸；cluster 尺寸越小，说明当前 cluster 的网格越密集，这时需要使用更高的量化精度；而 cluster 尺寸越大，则说明当前 cluster 的网格越稀疏，此时可以用更低的量化精度。另外 Nanite 发现过低的量化精度更容易在场景里面出问题，并且也只会节省很少的磁盘体积，所以在 Auto 模式下 Nanite 会限制最小量化精度。
+
+Nanite 在量化之前还会检查所有 cluster 在当前选择的量化精度下是否可编码：
+
+```cpp
+// 计算量化 scale
+float QuantizationScale = FMath::Exp2((float)PositionPrecision);
+
+// 检查所有 cluster 在当前量化精度下是否可编码
+for (const FCluster& Cluster : Clusters)
+{
+    // 跳过没有三角形的 cluster
+    if (Cluster.NumTris == 0)
+    {
+        continue;
+    }
+
+    // cluster 的包围盒
+    const FBounds3f& Bounds = Cluster.Bounds;
+    
+    int32 Iterations = 0;
+    while (true)
+    {
+        // 将 cluster 包围盒的 Min 按当前量化精度转换到整数坐标空间
+        float MinX = FMath::RoundToFloat(Bounds.Min.X * QuantizationScale);
+        float MinY = FMath::RoundToFloat(Bounds.Min.Y * QuantizationScale);
+        float MinZ = FMath::RoundToFloat(Bounds.Min.Z * QuantizationScale);
+
+        // 将 cluster 包围盒的 Max 按当前量化精度转换到整数坐标空间
+        float MaxX = FMath::RoundToFloat(Bounds.Max.X * QuantizationScale);
+        float MaxY = FMath::RoundToFloat(Bounds.Max.Y * QuantizationScale);
+        float MaxZ = FMath::RoundToFloat(Bounds.Max.Z * QuantizationScale);
+
+        // 是否可编码的条件:
+        // 1. 量化后的 cluster 包围盒的 Min/Max 是否可以安全转换成 int32
+        // 2. 量化后的 cluster 包围盒每个轴的局部跨度不能超过 21 bits 可以表示的最大值
+        if (MinX >= FLT_INT_MIN && MinY >= FLT_INT_MIN && MinZ >= FLT_INT_MIN &&
+            MaxX <= FLT_INT_MAX && MaxY <= FLT_INT_MAX && MaxZ <= FLT_INT_MAX &&
+            ((int64)MaxX - (int64)MinX) <= MaxPositionQuantizedValue && ((int64)MaxY - (int64)MinY) <= MaxPositionQuantizedValue && ((int64)MaxZ - (int64)MinZ) <= MaxPositionQuantizedValue)
+        {
+            break;
+        }
+        
+        // 如果不可编码, 就把全局统一量化精度 -1, 直到所有 cluster 满足编码条件
+        QuantizationScale *= 0.5f;
+        PositionPrecision--;
+        check(PositionPrecision >= NANITE_MIN_POSITION_PRECISION);
+        check(++Iterations < 100);  // Endless loop?
+    }
+}
+```
+
+Nanite 会将每个 cluster 包围盒的 Min/Max Position 按当前全局统一量化精度映射到整数坐标空间，并检查该整数空间下的包围盒：只有当量化后的 Min/Max Position 值可以安全转换成 `int32`，并且每个轴上的局部跨度都不超过每轴 21 bits 可表示的最大值时，才认为当前 cluster 在当前全局统一量化精度下是可编码的。如果发现某些 cluster 不可编码，就降低全局统一量化精度，直到所有非空 cluster 都满足可编码条件。
+
+确定好最终的全局统一量化精度后，Nanite 会开始并行量化每个 cluster 的顶点 Position：
+
+```cpp
+// 量化 scale 的倒数, 用于将量化后的整数 Position 值反量化为量化网格上的浮点 Position 值
+const float RcpQuantizationScale = 1.0f / QuantizationScale;
+
+// 初始化 Cluster.QuantizedPositions
+const uint32 NumClusterVerts = Cluster.Verts.Num();
+Cluster.QuantizedPositions.SetNumUninitialized(NumClusterVerts);
+
+// 初始化当前 cluster 的整数包围盒
+FIntVector IntClusterMax = { MIN_int32, MIN_int32, MIN_int32 };
+FIntVector IntClusterMin = { MAX_int32, MAX_int32, MAX_int32 };
+
+for (uint32 i = 0; i < NumClusterVerts; i++)
+{
+    // 读取浮点 Position
+    const FVector3f Position = Cluster.Verts.GetPosition(i);
+
+    FIntVector& IntPosition = Cluster.QuantizedPositions[i];
+
+    // 将浮点 Position 的每个轴量化到整数坐标空间
+    float PosX = FMath::RoundToFloat(Position.X * QuantizationScale);
+    float PosY = FMath::RoundToFloat(Position.Y * QuantizationScale);
+    float PosZ = FMath::RoundToFloat(Position.Z * QuantizationScale);
+
+    // 先写入全局量化网格下的绝对整数 Position 值, 后续再减去 IntClusterMin 转成 cluster 局部整数偏移
+    IntPosition = FIntVector((int32)PosX, (int32)PosY, (int32)PosZ);
+
+    // 更新当前 cluster 包围盒每个轴的整数 Min/Max
+    IntClusterMax.X = FMath::Max(IntClusterMax.X, IntPosition.X);
+    IntClusterMax.Y = FMath::Max(IntClusterMax.Y, IntPosition.Y);
+    IntClusterMax.Z = FMath::Max(IntClusterMax.Z, IntPosition.Z);
+    IntClusterMin.X = FMath::Min(IntClusterMin.X, IntPosition.X);
+    IntClusterMin.Y = FMath::Min(IntClusterMin.Y, IntPosition.Y);
+    IntClusterMin.Z = FMath::Min(IntClusterMin.Z, IntPosition.Z);
+}
+
+// 根据包围盒每个轴的整数 Min/Max 计算每个轴的跨度需要的 bits 数
+const uint32 NumBitsX = FMath::CeilLogTwo(IntClusterMax.X - IntClusterMin.X + 1);
+const uint32 NumBitsY = FMath::CeilLogTwo(IntClusterMax.Y - IntClusterMin.Y + 1);
+const uint32 NumBitsZ = FMath::CeilLogTwo(IntClusterMax.Z - IntClusterMin.Z + 1);
+// 检查每个轴需要的 bits 数没有超过 NANITE_MAX_POSITION_QUANTIZATION_BITS
+check(NumBitsX <= NANITE_MAX_POSITION_QUANTIZATION_BITS);
+check(NumBitsY <= NANITE_MAX_POSITION_QUANTIZATION_BITS);
+check(NumBitsZ <= NANITE_MAX_POSITION_QUANTIZATION_BITS);
+
+// 第二次遍历, 回写量化后的浮点 Position, 并转成局部整数偏移
+for (uint32 i = 0; i < NumClusterVerts; i++)
+{
+    FIntVector& IntPosition = Cluster.QuantizedPositions[i];
+
+    // 将 Verts 中的浮点 Position 值更新成量化后的绝对浮点 Position 值
+    Cluster.Verts.GetPosition(i) = FVector3f((float)IntPosition.X * RcpQuantizationScale, (float)IntPosition.Y * RcpQuantizationScale, (float)IntPosition.Z * RcpQuantizationScale);
+    
+    // 把绝对量化整数 Position 值转换成相对于 IntClusterMin 的 cluster 局部整数偏移
+    IntPosition.X -= IntClusterMin.X;
+    IntPosition.Y -= IntClusterMin.Y;
+    IntPosition.Z -= IntClusterMin.Z;
+
+    // 检查每个轴相对于 IntClusterMin 的局部整数偏移非负, 并且在当前轴的 bit 数可表示范围内
+    check(IntPosition.X >= 0 && IntPosition.X < (1 << NumBitsX));
+    check(IntPosition.Y >= 0 && IntPosition.Y < (1 << NumBitsY));
+    check(IntPosition.Z >= 0 && IntPosition.Z < (1 << NumBitsZ));
+}
+
+// 同样将包围盒更新成量化后的绝对浮点 Position 值
+Cluster.Bounds.Min = FVector3f((float)IntClusterMin.X * RcpQuantizationScale, (float)IntClusterMin.Y * RcpQuantizationScale, (float)IntClusterMin.Z * RcpQuantizationScale);
+Cluster.Bounds.Max = FVector3f((float)IntClusterMax.X * RcpQuantizationScale, (float)IntClusterMax.Y * RcpQuantizationScale, (float)IntClusterMax.Z * RcpQuantizationScale);
+
+// 记录每个轴保存局部整数偏移需要多少 bit 位
+Cluster.QuantizedPosBits = FIntVector(NumBitsX, NumBitsY, NumBitsZ);
+// 记录当前 cluster 量化整数包围盒的 Min，也就是局部整数偏移的起点 QuantizedPosStart
+Cluster.QuantizedPosStart = IntClusterMin;
+// 记录全局统一量化精度
+Cluster.QuantizedPosPrecision = PositionPrecision;
+```
+
+Nanite 先将当前 cluster 中每个顶点的浮点 Position 值按最终确定的全局 `PositionPrecision` 量化成绝对整数 Position 值，并在这个过程中统计当前 cluster 在整数坐标空间下的 Min/Max；接着根据整数 Min/Max 计算每个轴保存局部整数偏移所需的 bit 数，然后将 `Cluster.QuantizedPositions` 中每个顶点的绝对整数 Position 值减去 `IntClusterMin`，也就是说：`Cluster.QuantizedPositions` 中记录的并不是量化后的绝对整数 Position 值，而是相对于 `IntClusterMin` 的 cluster 局部整数偏移；最后 Nanite 还会把 `Cluster.Verts` 和 `Cluster.Bounds` 更新成量化后的浮点 Position 值，并记录 `Cluster.QuantizedPosBits`、`Cluster.QuantizedPosStart` 和 `Cluster.QuantizedPosPrecision`，供后续编码和运行时解码使用。
+
+### 1.6. 量化 Cluster 顶点 BoneWeight
+
+如果 cluster 顶点格式中包含 BoneInfluence 数据，Nanite 还会在编码前对每个顶点的 BoneWeight 进行量化处理。这里需要注意，`BoneWeightPrecision` 控制的是 BoneWeight 的量化精度，并不控制 BoneIndex 的编码精度；BoneIndex 后续会根据 cluster 中实际使用到的最大 BoneIndex 单独计算需要的 bit 数。
+
+Nanite 会先确定 BoneWeight 的量化精度。当 `Settings.BoneWeightPrecision < 0` 时表示 Auto 模式，此时默认使用 8 bits 来量化 BoneWeight；否则使用 `Settings.BoneWeightPrecision` 指定的 bit 数，并将其限制在 `[0, NANITE_MAX_BLEND_WEIGHT_BITS]` 范围内：
+
+```cpp
+BoneWeightPrecision = (Settings.BoneWeightPrecision < 0) ? 8u : (int32)FMath::Clamp(Settings.BoneWeightPrecision, 0, NANITE_MAX_BLEND_WEIGHT_BITS);
+```
+
+然后根据量化精度计算量化后的目标总权重，并逐顶点处理它们的 `BoneInfluences`：
+
+```cpp
+static void QuantizeBoneWeights(FCluster& Cluster, int32 BoneWeightPrecision)
+{
+    // Cluster 顶点数量
+    const uint32 NumVerts           = Cluster.Verts.Num();
+    // 每个顶点格式中预留的 BoneInfluence 数量
+    const uint32 NumBoneInfluences  = Cluster.Verts.Format.NumBoneInfluences;
+
+    // 根据量化精度计算量化后的目标总权重, 如果 BoneWeightPrecision = 8, 那么 TargetTotalBoneWeight = (1 << 8) - 1 = 255
+    const uint32 TargetTotalBoneWeight = BoneWeightPrecision ? ((1u << BoneWeightPrecision) - 1u) : 1u;
+
+    // 遍历 cluster 内的每个顶点
+    for (uint32 VertIndex = 0; VertIndex < NumVerts; VertIndex++)
+    {
+        // 当前顶点的 BoneInfluences 数组, 其中每个 BoneInfluence 的 X 是 BoneIndex, Y 是 BoneWeight
+        FVector2f* BoneInfluences = Cluster.Verts.GetBoneInfluences(VertIndex);
+
+        // 处理每个顶点的 BoneInfluences
+        QuantizeAndSortBoneInfluenceWeights(TArrayView<FVector2f>(BoneInfluences, NumBoneInfluences), TargetTotalBoneWeight);
+    }
+}
+```
+
+`QuantizeBoneWeights()` 本身只负责逐顶点取出 `BoneInfluences`，真正处理单个顶点 BoneWeight 的逻辑在 `QuantizeAndSortBoneInfluenceWeights()` 中：它会先调用 `QuantizeWeights()` 得到量化后的整数权重，然后再将结果写回 `BoneInfluence.Y`，接着清理权重为 0 的 BoneIndex，并重新排序当前顶点的 BoneInfluences：
+
+```cpp
+void QuantizeAndSortBoneInfluenceWeights(TArrayView<FVector2f> BoneInfluences, uint32 TargetTotalQuantizedWeight)
+{
+    const uint32 NumBoneInfluences = BoneInfluences.Num();
+    TArray<uint32, TInlineAllocator<64>> QuantizedWeights;
+
+    // 量化顶点 BoneWeight
+    QuantizeWeights(NumBoneInfluences, TargetTotalQuantizedWeight, QuantizedWeights, [BoneInfluences](uint32 Index) -> float
+        {
+            return BoneInfluences[Index].Y;
+        });
+
+    for (uint32 i = 0; i < NumBoneInfluences; ++i)
+    {
+        // 把量化后的整数 BoneWeight 写回 BoneInfluence.Y
+        BoneInfluences[i].Y = (float)QuantizedWeights[i];
+        
+        // 如果某个 BoneInfluence 的量化 BoneWeight 为 0, 就把其 BoneIndex 也清成 0
+        if (QuantizedWeights[i] == 0)
+        {
+            BoneInfluences[i].X = 0.0f; // Clear index when weight is 0
+        }
+    }
+
+    // 对顶点的 BoneInfluences 进行排序: BoneWeight 大的排前面, BoneWeight 相同时 BoneIndex 大的排前面
+    // 后续 CalculateInfluences() 方法中会从前往后读取当前顶点的 BoneInfluences，一旦遇到量化后的 BoneWeight 为 0，就认为后续 BoneInfluence 都无效，并直接跳出遍历
+    BoneInfluences.Sort([](const FVector2f& A, const FVector2f& B) { return A.Y > B.Y || (A.Y == B.Y && A.X > B.X); });
+}
+```
+
+重排序当前顶点的 BoneInfluences 遵循：BoneWeight 大的排前面，BoneWeight 相同时 BoneIndex 大的排前面。这里重排序的主要目的，是配合后续 `CalculateInfluences()` 的逻辑遍历：`CalculateInfluences()` 会从前往后读取当前顶点的 BoneInfluences，一旦遇到量化后的 BoneWeight 为 0，就认为后续 BoneInfluence 都无效，并直接跳出遍历。
+
+最后看看真正执行 BoneWeight 量化和误差修正的 `QuantizeWeights()`：
+
+```cpp
+// 累加原始 BoneWeight 总和
+float TotalWeight = 0.0f;
+for (uint32 i = 0; i < N; i++)
+{
+    TotalWeight += (float)GetWeight(i);
+}
+
+// 如果当前这组权重总和接近 0，则无法按比例归一化，直接将所有量化权重置 0
+if (FMath::IsNearlyZero(TotalWeight))
+{
+    // bail early on zero total weight
+    QuantizedWeights.SetNumZeroed(N);
+    return;
+}
+
+// FHeapEntry 用于后续修正已量化整数 BoneWeight 的四舍五入误差
+struct FHeapEntry
+{
+    float Error;    // 某个已量化整数 BoneWeight 的四舍五入误差
+    uint32 Index;   // BoneWeight 索引
+};
+
+TArray<FHeapEntry, TInlineAllocator<64>> ErrorHeap;
+QuantizedWeights.SetNum(N);
+
+// 当前已量化整数 BoneWeight 总和
+uint32 TotalQuantizedWeight = 0;
+// 逐个 BoneWeight 量化
+for (uint32 i = 0; i < N; i++)
+{
+    // 把原始 BoneWeight 归一化后映射到目标整数区间
+    const float Weight = ((float)GetWeight(i) * (float)TargetTotalQuantizedWeight) / TotalWeight;
+    // 再四舍五入到整数
+    const uint32 QuantizedWeight = FMath::RoundToInt(Weight);
+    // 写入 QuantizedWeights
+    QuantizedWeights[i] = QuantizedWeight;
+    // 并记录本次四舍五入误差
+    ErrorHeap.Emplace(FHeapEntry{ (float)QuantizedWeight - Weight, i });
+    // 累加已量化整数 BoneWeight 总和
+    TotalQuantizedWeight += QuantizedWeight;
+}
+
+// 如果当前已量化整数 BoneWeight 总和不等于目标总 BoneWeight, 则进行误差修正
+if (TotalQuantizedWeight != TargetTotalQuantizedWeight)
+{
+    // 当前已量化整数 BoneWeight 总和是偏小还是偏大
+    const bool bTooSmall = (TotalQuantizedWeight < TargetTotalQuantizedWeight);
+    // 总和偏小, 后面每次修正给某个权重 +1; 总和偏大, 后面每次修正给某个权重 -1;
+    const int32 Diff = bTooSmall ? 1 : -1;
+
+    // ErrorHeap 中 FHeapEntry 的比较规则
+    auto Predicate = [bTooSmall](const FHeapEntry& A, const FHeapEntry& B)
+        {
+            if (bTooSmall)
+            {
+                // 如果是总和偏小: 误差小的排前面, 误差小的最适合权重 +1
+                return (A.Error != B.Error) ? (A.Error < B.Error) : (A.Index < B.Index);
+            }
+            else
+            {
+                // 而如果是总和偏大: 误差大的排前面, 误差大的最适合权重 -1
+                return (A.Error != B.Error) ? (A.Error > B.Error) : (A.Index > B.Index);
+            }
+        };
+
+    // 构建堆, 每次取出最适合修正的已量化整数 BoneWeight
+    ErrorHeap.Heapify(Predicate);
+        
+    // 误差修正, 直到已量化整数 BoneWeight 总和等于目标总 BoneWeight
+    while (TotalQuantizedWeight != TargetTotalQuantizedWeight)
+    {
+        // 确保堆中还有元素可取
+        check(ErrorHeap.Num() > 0);
+
+        // 每次取出当前堆中最适合修正的已量化整数 BoneWeight
+        FHeapEntry Entry;
+        ErrorHeap.HeapPop(Entry, Predicate, EAllowShrinking::No);
+            
+        // 进行修正
+        QuantizedWeights[Entry.Index] += Diff;
+        TotalQuantizedWeight += Diff;
+    }
+}
+```
+
+Nanite 首先累加顶点 BoneInfluences 中的原始 BoneWeight 总和，然后根据原始 BoneWeight 总和对每个 BoneWeight 进行归一化并映射到目标总 BoneWeight 区间，再对其进行四舍五入后写入 `QuantizedWeights`，同时记录每次四舍五入后产生的有符号误差；
+
+将所有 BoneWeight 量化结束后，检查当前已量化整数 BoneWeight 总和是否等于目标总 BoneWeight，如果不相等则还需要进行误差修正，保证所有已量化整数 BoneWeight 总和等于目标总 BoneWeight。修正的核心逻辑是：首先根据当前已量化 BoneWeight 总和是大于还是小于目标总 BoneWeight，如果总和偏小，则后续修正需要增加已量化整数 BoneWeight 值；而如果总和偏大，则需要减少已量化整数 BoneWeight 值。
+
+修正之前会先根据比较结果将已记录的每个 BoneWeight 量化的误差记录建堆，总和偏小时，误差小的优先；总和偏大时，误差大的优先；
+
+修正时，每次只从堆中取一个最优先的已量化整数 BoneWeight，并根据比较结果对其进行 +1 或 -1，直到当前已量化整数 BoneWeight 总和等于目标总 BoneWeight。
 
 ## 2. 编码 Cluster DAG
 
-## 2. References
+进过前面的规范化处理后，Cluster 数据已经被整理成适合编码的标准格式。接下来 Nanite 会开始为每个 cluster 计算具体的编码信息和 GPU 数据尺寸，并基于这些信息完成 Page 分配、层级结构构建、Page 依赖关系计算以及最终将 Page 数据写入磁盘。
+
+### 2.1. 计算 Cluster 编码信息
+
+
+## 3. References
 
 - [Nanite: A Deep Dive](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
 - [GAMES 104: GPU-Driven Geometry Pipeline - Nanite](https://www.piccoloengine.com/merch/8)
