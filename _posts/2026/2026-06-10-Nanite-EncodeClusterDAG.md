@@ -1264,6 +1264,8 @@ static void BuildVertReuseBatches(FCluster& Cluster)
 
 ### 1.5. 使用全局统一精度量化 Cluster 顶点 Position
 
+首先说说什么是**量化（Quantize）**：量化就是**把连续、高精度的数值，按某个固定精度映射成离散的整数值**。Nanite 通过量化把浮点 Position 映射到可控精度的整数网格上，再转换成 cluster 局部整数偏移，并用尽可能少的 bit 数对顶点 Position 进行紧凑编码。
+
 在 cluster 完成约束、拆分以及 stripify 后，此时每个 cluster 的几何数据已经稳定，Nanite 会**给整个 Nanite 网格选择一个全局统一的 Position 量化精度 `PositionPrecision`**，然后把每个 cluster 的浮点型顶点 Position 量化成 cluster 局部整数偏移，并记录运行时解码需要的元数据。
 
 Nanite 首先会检查当前定义值并做一次最坏情况验证，验证 Nanite 定义的常量值组合本身是否是自洽的：
@@ -1635,8 +1637,204 @@ Nanite 首先累加顶点 BoneInfluences 中的原始 BoneWeight 总和，然后
 
 ### 2.1. 计算 Cluster 编码信息
 
+//todo
 
 ## 3. References
 
 - [Nanite: A Deep Dive](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
 - [GAMES 104: GPU-Driven Geometry Pipeline - Nanite](https://www.piccoloengine.com/merch/8)
+
+---
+
+<!-- [@superpowers](plugin://superpowers@openai-curated-remote) [NaniteEncode.cpp](Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp) [NaniteEncodeGeometryData.cpp](Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp) [2026-06-10-Nanite-EncodeClusterDAG.md](Engine/AIStuffs/2026-06-10-Nanite-EncodeClusterDAG.md)先了解整体源码以及md笔记，再详细分析下CalculateEncodingInfo方法中的核心逻辑，它主要是在做什么。回答的风格参考md笔记
+
+### 2.1. 计算 Cluster 编码信息
+
+源码入口在 [NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:1245)，前面已经完成了 position 量化、bone weight 量化、材质 range 统计等准备工作，然后 Nanite 会并行为每个 cluster 调用 `CalculateEncodingInfo()`：
+
+```cpp
+CalculateEncodingInfos(EncodingInfos, ClusterDAG.Clusters,
+    Resources.NormalPrecision,
+    Resources.TangentPrecision,
+    BoneWeightPrecision);
+```
+
+`CalculateEncodingInfo()` 的核心作用可以概括为一句话：
+
+**它并不真正写入 cluster 的几何数据，而是先为当前 cluster 计算“后续应该怎么编码”和“编码后每个 GPU page section 需要多少字节”。**
+
+也就是说，它产出的 `FEncodingInfo` 是后续 Page 分配、Cluster Header 打包、DecodeInfo 写入、GeometryData 编码共同依赖的一份“编码说明书”。
+
+### 1. 先计算 Index 编码规格
+
+源码位置：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:344)
+
+```cpp
+const uint32 BitsPerIndex =
+    NumClusterVerts > 1 && NumClusterTris > 1
+    ? FloorLog2(NumClusterVerts - 1) + 1
+    : 1;
+
+const uint32 BitsPerTriangle = BitsPerIndex + 2 * 5;
+```
+
+这里的逻辑是：cluster 内顶点数量越少，三角形索引需要的 bit 数也越少。比如一个 cluster 只有 64 个顶点，那么每个顶点 index 只需要 6 bits。
+
+`BitsPerTriangle = BitsPerIndex + 2 * 5` 表示每个三角形编码为：
+
+```text
+base vertex index + 两个 5-bit offset
+```
+
+因此 `Info.BitsPerIndex` 后续会写入 `FPackedCluster`，GPU 解码时就知道 index bitstream 里每个 base index 应该读多少 bit。
+
+### 2. 计算当前 Cluster 在 GPU Page 中的各段大小
+
+接着会填充 `Info.GpuSizes`：
+
+```cpp
+GpuSizes.Cluster = sizeof(FPackedCluster);
+GpuSizes.MaterialTable = CalcMaterialTableSize(Cluster) * sizeof(uint32);
+GpuSizes.VertReuseBatchInfo = ...;
+GpuSizes.DecodeInfo = NumTexCoords * sizeof(FPackedUVHeader)
+                    + optional bone header;
+GpuSizes.Index = AlignToDword(NumClusterTris * BitsPerTriangle);
+GpuSizes.BrickData = Cluster.Bricks.Num() * sizeof(FPackedBrick);
+```
+
+这些 size 非常关键。后续 `AssignClustersToPages()` 会直接累加 `EncodingInfo.GpuSizes` 来判断当前 page 还能不能放下这个 cluster：[NaniteEncodePageAssignment.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodePageAssignment.cpp:89)
+
+所以这里本质上是在提前给每个 cluster 算一笔“显存账本”。
+
+### 3. 计算 Attribute 每顶点需要多少 bit
+
+压缩路径下，`BitsPerAttribute` 会从 normal 开始累加：
+
+```cpp
+Info.BitsPerAttribute = 2 * NormalPrecision;
+```
+
+Normal 使用 octahedron 编码，所以只需要两个分量，每个分量 `NormalPrecision` bits。
+
+如果 cluster 有 tangent：
+
+```cpp
+Info.BitsPerAttribute += 1 + TangentPrecision;
+```
+
+这里多出来的 `1` 是 tangent Y sign，`TangentPrecision` 是 tangent angle 的量化 bit 数。
+
+### 4. 根据 Cluster 内颜色范围决定 Color 编码
+
+默认情况下：
+
+```cpp
+Info.ColorMode = CONSTANT;
+Info.ColorMin = (255,255,255,255);
+```
+
+如果 cluster 有 vertex color，Nanite 会遍历所有顶点，统计 RGBA 每个通道的最小值和最大值，然后计算每个通道实际需要多少 bit：
+
+```cpp
+ColorDelta = ColorMax - ColorMin;
+R_Bits = CeilLogTwo(ColorDelta.R + 1);
+...
+Info.ColorMin = ColorMin;
+Info.ColorBits = (R_Bits, G_Bits, B_Bits, A_Bits);
+```
+
+这里的思想是 cluster-local range encoding：  
+不是直接为 RGBA 固定写 8 bits，而是先保存 `ColorMin`，实际编码时只写 `Color - ColorMin`。如果某个通道在整个 cluster 中都是常量，那么它需要的 bit 数就是 0。
+
+后续 `EncodeGeometryData()` 会用这些信息真正写 color delta：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:806)
+
+### 5. 根据每个 UV 通道的范围决定 UV 编码
+
+UV 的处理和 Color 类似，但会先把 float UV 编码成一种可排序的整数格式：
+
+```cpp
+EncodedU = EncodeUVFloat(UV.X, NumMantissaBits);
+EncodedV = EncodeUVFloat(UV.Y, NumMantissaBits);
+```
+
+然后统计当前 cluster 中该 UV 通道的 `UVMin / UVMax`，计算 U/V 分量分别需要多少 bit：
+
+```cpp
+UVInfo.Min = UVMin;
+UVInfo.NumBits.X = CeilLogTwo(UVDelta.X + 1);
+UVInfo.NumBits.Y = CeilLogTwo(UVDelta.Y + 1);
+```
+
+后续真正写 UV 时，会重新 `EncodeUVFloat()`，再减去 `UVInfo.Min`，只写 cluster-local offset：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:665)
+
+### 6. 如果有 Skinning，计算骨骼影响编码信息
+
+如果 `MaxBones > 0`，它会调用 `CalculateInfluences()`：
+
+```cpp
+CalculateInfluences(Info.BoneInfluence, Cluster, BoneWeightPrecision);
+```
+
+这一步会统计：
+
+```text
+NumVertexBoneInfluences
+NumVertexBoneIndexBits
+NumVertexBoneWeightBits
+ClusterBoneInfluences
+VoxelBoneInfluences
+BrickBoneIndices
+```
+
+然后根据每个顶点需要写多少个 influence，以及每个 influence 的 bone index / weight 需要多少 bit，计算 `GpuSizes.BoneInfluence`。
+
+这里需要注意：`BoneWeightPrecision` 只控制 weight bit 数；bone index bit 数是根据当前 cluster 实际出现的最大 bone index 算出来的。
+
+### 7. 最后计算 Position / Attribute Stream 大小
+
+前面 position 已经在 `CalculateQuantizedPositionsUniformGrid()` 中量化好了，所以这里直接使用 cluster 已经记录的：
+
+```cpp
+Cluster.QuantizedPosBits.X/Y/Z
+```
+
+计算每个顶点 position 的 bit 数：
+
+```cpp
+PositionBitsPerVertex =
+    QuantizedPosBits.X +
+    QuantizedPosBits.Y +
+    QuantizedPosBits.Z;
+
+GpuSizes.Position =
+    AlignToDword(NumPositions * PositionBitsPerVertex);
+
+GpuSizes.Attribute =
+    AlignToDword(NumClusterVerts * Info.BitsPerAttribute);
+```
+
+所以 `CalculateEncodingInfo()` 最终会同时确定：
+
+```text
+当前 cluster 的解码参数
+当前 cluster 的各数据段 GPU 字节大小
+当前 cluster 写入 page 时需要的 offset 推进量
+```
+
+### 8. 这些信息后续怎么被使用
+
+`PackCluster()` 会把 `BitsPerIndex`、`BitsPerAttribute`、normal/tangent precision、color bits、UV bit offset 等写入 `FPackedCluster`：[NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:126)
+
+`WritePages()` 会根据 `EncodingInfo.GpuSizes` 推进每个 section 的 offset，并把这些 offset 写入 cluster header：[NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:604)
+
+`EncodeGeometryData()` 会按照 `FEncodingInfo` 中记录的 bit 数、min 值、precision 等，真正把 position、normal、tangent、color、UV、bone influence 写入 byte streams。
+
+### 小结
+
+`CalculateEncodingInfo()` 可以理解为 Nanite 编码阶段里的 **per-cluster 编码预分析**。
+
+它主要做三件事：
+
+1. **决定怎么编码**：index 几 bit、normal/tangent 几 bit、color/UV 是否需要 range encoding、bone influence 怎么写。
+2. **决定写多大**：计算 cluster header、material table、decode info、index、position、attribute、bone、brick 等 GPU section 的字节数。
+3. **服务后续流程**：Page 分配靠它判断容量，PackCluster 靠它写 decode metadata，EncodeGeometryData 靠它真正生成压缩后的几何数据。 -->
