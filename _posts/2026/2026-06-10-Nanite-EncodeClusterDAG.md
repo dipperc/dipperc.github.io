@@ -1801,8 +1801,6 @@ uint32 CalcVertReuseBatchInfoSize(const TArrayView<const FMaterialRange>& Materi
 
 而对于材质段数量超过 3 的 cluster，Nanite 会将
 
----
-
 接下来 Nanite 继续计算顶点数据相关的编码信息。
 
 ## 3. References
