@@ -7,13 +7,13 @@ category: Unreal Engine
 
 - [1. 准备编码数据](#1-准备编码数据)
   - [1.1. 清理非法属性值以及删除退化三角形](#11-清理非法属性值以及删除退化三角形)
-  - [1.2. 按材质重新排序 Cluster 内的三角形](#12-按材质重新排序-cluster-内的三角形)
+  - [1.2. 按材质重新排序 Cluster 内的三角形并构建材质段信息](#12-按材质重新排序-cluster-内的三角形并构建材质段信息)
   - [1.3. **Stripify** Cluster](#13-stripify-cluster)
   - [1.4. 为每个材质段切分 Batches](#14-为每个材质段切分-batches)
   - [1.5. 使用全局统一精度量化 Cluster 顶点 Position](#15-使用全局统一精度量化-cluster-顶点-position)
   - [1.6. 量化 Cluster 顶点 BoneWeight](#16-量化-cluster-顶点-boneweight)
 - [2. 编码 Cluster DAG](#2-编码-cluster-dag)
-  - [2.1. 计算 Cluster 编码信息](#21-计算-cluster-编码信息)
+  - [2.1. 计算 Cluster 编码信息和 GPU Page 数据大小](#21-计算-cluster-编码信息和-gpu-page-数据大小)
 - [3. References](#3-references)
 
 本篇笔记是 Unreal Engine 的 Nanite 系统中关于编码 Cluster DAG 数据的源码分析理解，基于引擎版本 5.7.3 release。
@@ -40,12 +40,12 @@ Nanite 首先会清理 cluster 中的非法顶点属性，避免 NaN 或者越�
 
 // 删除退化三角形: 删除三个顶点里有重复顶点的三角形
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Nanite::Build::RemoveDegenerateTriangles);    // TODO: is this still necessary?
+    TRACE_CPUPROFILER_EVENT_SCOPE(Nanite::Build::RemoveDegenerateTriangles);
     RemoveDegenerateTriangles( ClusterDAG.Clusters );
 }
 ```
 
-### 1.2. 按材质重新排序 Cluster 内的三角形
+### 1.2. 按材质重新排序 Cluster 内的三角形并构建材质段信息
 
 Nanite 还会把每个 cluster 内的三角形**按材质重新排序**，最终使得 cluster 内**使用相同材质的三角形会被排序在一起，从而形成连续的区间，并且所在材质区间越大的三角形排的越靠前**。
 
@@ -135,7 +135,7 @@ if (CurrentRange.RangeLength > 0)
 }
 ```
 
-`MaterialRanges` 数组中的每个 `MaterialRange` 元素记录了 cluster 内从第 `RangeStart` 个三角形开始，连续 `RangeLength` 个三角形，都是使用的材质 `MaterialIndex`。
+`MaterialRanges` 数组中的每个材质段 `MaterialRange` 记录了 cluster 内从第 `RangeStart` 个三角形开始，连续 `RangeLength` 个三角形，都是使用的材质 `MaterialIndex`。
 
 最后才真正重新排序 cluster 的顶点索引 `Indexes` 和材质索引 `MaterialIndexes`：
 
@@ -212,9 +212,9 @@ void BuildTables( const FCluster& Cluster )
         VertexToTriangleMasks[ i1 ][ i >> 5 ] |= 1 << ( i & 31 );
         VertexToTriangleMasks[ i2 ][ i >> 5 ] |= 1 << ( i & 31 );
 
-        // 计算三角形 3 个顶点**位置和**的 x 分量值, 后续选 strip 起点时, 如果评分相同, 则用它决定谁优先
+        // 计算三角形 3 个顶点**位置和**的 X 分量值, 后续选 strip 起点时, 如果评分相同, 则用它决定谁优先
         FVector3f ScaledCenter = Cluster.Verts.GetPosition( i0 ) + Cluster.Verts.GetPosition( i1 ) + Cluster.Verts.GetPosition( i2 );
-        TrianglePriorities[ i ] = ScaledCenter.X;   //TODO: Find a good direction to sort by instead of just picking x?
+        TrianglePriorities[ i ] = ScaledCenter.X;
 
         // 为三角形 i 的 Corner 0 建立链表节点, 需要注意: 当前三角形 Corner 0 代表的是它的有向边 i1 -> i2
         FEdgeNode& Node0 = EdgeNodes[ i * 3 + 0 ];
@@ -280,7 +280,7 @@ void BuildTables( const FCluster& Cluster )
 
 三角形 `Corner` 的数据类型是 `uint16`，其高 14 位编码了三角形索引 `i`，低 2 位编码了三角形 `i` 中的局部顶点索引 `0/1/2`，也就是说一个三角形 `Corner` 表示的是三角形 `i` 的 3 个顶点中的某一个。不过在上面的源码中，Nanite 也会用这个 `Corner` 来代表**它所表示的三角形顶点对面的那条有向边**。举个例子：`Corner(i, 0)` 表示的是三角形 `i` 的第 0 个顶点 `i0`，而它对应的对边是三角形 `i` 的有向边 `i1 -> i2`；同理，`Corner(i, 1)` 对应有向边 `i2 -> i0`，`Corner(i, 2)` 对应有向边 `i0 -> i1`。
 
-`BuildTables()` 是在 stripify 之前的关键一步，它根据 cluster 的原始网格信息构建了 stripify 所需的数据：首先是 `VertexToTriangleMasks`，它记录 **cluster 内每个顶点关联了哪些三角形**，通过 `VertexToTriangleMasks[ vertex index ][ DWORD i ]` 可以快速知道某个 32-triangle DWORD 中有哪些三角形使用了顶点 `Verts[index]`；其次是 `OppositeCorner`，它记录**每个三角形 `Corner` 所代表的有向边，其反向共享边对应的是哪个三角形 `Corner`**，后续 stripify 时会根据此数据找左/右相邻三角形；最后 `TrianglePriorities` 则是保存每个三角形 3 个顶点**位置和**的 `x` 分量值，后续选 strip 起点三角形时，如果评分相同，则用它决定谁优先。
+`BuildTables()` 是在 stripify 之前的关键一步，它根据 cluster 的原始网格信息构建了 stripify 所需的数据：首先是 `VertexToTriangleMasks`，它记录 **cluster 内每个顶点关联了哪些三角形**，通过 `VertexToTriangleMasks[ vertex index ][ DWORD i ]` 可以快速知道某个 32-triangle DWORD 中有哪些三角形使用了顶点 `Verts[index]`；其次是 `OppositeCorner`，它记录**每个三角形 `Corner` 所代表的有向边，其反向共享边对应的是哪个三角形 `Corner`**，后续 stripify 时会根据此数据找左/右相邻三角形；最后 `TrianglePriorities` 则是保存每个三角形 3 个顶点**位置和**的 `X` 分量值，后续选 strip 起点三角形时，如果评分相同，则用它决定谁优先。
 
 再来看看 `NewScoreVertex()`：
 
@@ -501,7 +501,7 @@ return NumNewVertices;
 
 现在总结一下上面说的 3 个关键方法的核心逻辑：
 
-`BuildTables()` 方法主要构建 stripify 所需的几类辅助数据：`VertexToTriangleMasks` 记录每个旧顶点关联了哪些旧三角形；`OppositeCorner` 通过三角形 `Corner` 记录邻接三角形之间的反向共享边信息，Nanite 后续可以根据三角形 `Corner` 找到特定的左侧或者右侧邻接三角形；`TrianglePriorities` 保存每个旧三角形 3 个旧顶点位置和的 `x` 分量值，后续在评分相同的情况下，用它决定哪个三角形优先作为 strip 起点输出。
+`BuildTables()` 方法主要构建 stripify 所需的几类辅助数据：`VertexToTriangleMasks` 记录每个旧顶点关联了哪些旧三角形；`OppositeCorner` 通过三角形 `Corner` 记录邻接三角形之间的反向共享边信息，Nanite 后续可以根据三角形 `Corner` 找到特定的左侧或者右侧邻接三角形；`TrianglePriorities` 保存每个旧三角形 3 个旧顶点位置和的 `X` 分量值，后续在评分相同的情况下，用它决定哪个三角形优先作为 strip 起点输出。
 
 而 `NewScoreVertex()` 方法主要是根据一个旧顶点是否可以作为 ref 顶点、作为 ref 顶点时距离当前新顶点序列末尾有多远，以及候选三角形的拓扑上下文为这个旧顶点打分。`NewScoreTriangle()` 则是把三角形 3 个旧顶点的分数相加，用于决定 strip 起点和 strip 延伸时优先选择哪个候选三角形。
 
@@ -516,7 +516,7 @@ Nanite 是**按材质段 `MaterialRange` 分段**进行 stripify 的，这样可
 首先会初始化相关数据：
 
 ```cpp
-// 清掉旧的 Cluster.StripIndexData 字节流
+// 清掉旧的 Cluster.StripIndexData
 Cluster.StripIndexData.Empty();
 // 初始化 BitWriter, 绑定数组 Cluster.StripIndexData
 FBitWriter BitWriter( Cluster.StripIndexData );
@@ -529,7 +529,7 @@ uint32 NumNewVerticesInDword[ 4 ] = {};
 uint32 NumRefVerticesInDword[ 4 ] = {};
 ```
 
-`Cluster.StripIndexData` 是一个连续、紧凑的 5-bit 位流，Nanite 通过 `BitWriter.PutBits(BaseVertex - Index, 5)` 以**低位优先**的顺序向其中写入连续的 5-bit ref 偏移值，每满 8 bits 就会将其转换为一个 `uint8` 并添加进 `Cluster.StripIndexData` 数组中。
+`Cluster.StripIndexData` 是一个连续、紧凑的 5-bit **bitstream（位流）**，Nanite 通过 `BitWriter.PutBits(BaseVertex - Index, 5)` 以**低位优先**的顺序向其中写入连续的 5-bit ref 偏移值，每满 8 bits 就会将其转换为一个 `uint8` 并添加进 `Cluster.StripIndexData` 数组中。
 
 按材质段分段进行 stripify 时，首先会将当前材质段内的所有旧三角形标记为候选状态，后续 stripify 时只处理候选三角形：
 
@@ -636,7 +636,7 @@ if( Score > BestScore )
 }
 else if( Score == BestScore )
 {
-    // 分数相同时根据 3 个顶点位置和的 x 分量值决定选谁当起点
+    // 分数相同时根据 3 个顶点位置和的 X 分量值决定选谁当起点
     float Priority = TrianglePriorities[ TriangleIndex ];
     if( Priority > BestPriority )
     {
@@ -933,7 +933,7 @@ const uint32 PaddedSize = Cluster.StripIndexData.Num() + 5;
 TArray<uint8> PaddedStripIndexData;
 PaddedStripIndexData.Reserve( PaddedSize );
 
-PaddedStripIndexData.Add( 0 );   // TODO: Workaround for empty list and reading from negative offset
+PaddedStripIndexData.Add( 0 );
 PaddedStripIndexData.Append( Cluster.StripIndexData );
 
 // UnpackTriangleIndices is 1:1 with the GPU implementation.
@@ -1481,9 +1481,9 @@ BoneWeightPrecision = (Settings.BoneWeightPrecision < 0) ? 8u : (int32)FMath::Cl
 ```cpp
 static void QuantizeBoneWeights(FCluster& Cluster, int32 BoneWeightPrecision)
 {
-    // Cluster 顶点数量
+    // 当前 cluster 顶点数
     const uint32 NumVerts           = Cluster.Verts.Num();
-    // 每个顶点格式中预留的 BoneInfluence 数量
+    // 当前 cluster 顶点格式中最多支持的 BoneInfluence 数量
     const uint32 NumBoneInfluences  = Cluster.Verts.Format.NumBoneInfluences;
 
     // 根据量化精度计算量化后的目标总权重, 如果 BoneWeightPrecision = 8, 那么 TargetTotalBoneWeight = (1 << 8) - 1 = 255
@@ -1605,7 +1605,7 @@ if (TotalQuantizedWeight != TargetTotalQuantizedWeight)
 
     // 构建堆, 每次取出最适合修正的已量化整数 BoneWeight
     ErrorHeap.Heapify(Predicate);
-        
+
     // 误差修正, 直到已量化整数 BoneWeight 总和等于目标总 BoneWeight
     while (TotalQuantizedWeight != TargetTotalQuantizedWeight)
     {
@@ -1633,208 +1633,179 @@ Nanite 首先累加顶点 BoneInfluences 中的原始 BoneWeight 总和，然后
 
 ## 2. 编码 Cluster DAG
 
-进过前面的规范化处理后，Cluster 数据已经被整理成适合编码的标准格式。接下来 Nanite 会开始为每个 cluster 计算具体的编码信息和 GPU 数据尺寸，并基于这些信息完成 Page 分配、层级结构构建、Page 依赖关系计算以及最终将 Page 数据写入磁盘。
+进过前面的规范化处理后，cluster 数据已经被整理成适合编码的标准格式。接下来 Nanite 会开始为每个 cluster 计算具体的编码信息和 GPU 数据尺寸，并基于这些信息完成 page 分配、层级结构构建、page 依赖关系计算以及最终将 page 数据写入磁盘。
 
-### 2.1. 计算 Cluster 编码信息
+### 2.1. 计算 Cluster 编码信息和 GPU Page 数据大小
 
-//todo
+Nanite 为每个 cluster 计算它们的编码信息 `FEncodingInfo`。`FEncodingInfo` 中主要包含 3 类数据：**首先是编码 bit 数和量化精度**，例如单个顶点索引 bit 数 `BitsPerIndex`、每个顶点所有属性的总 bit 数 `BitsPerAttribute`、法线 octahedron 编码每个分量的 bit 数 `NormalPrecision`，以及切线角度量化 bit 数 `TangentPrecision`；**其次是顶点属性的解码元数据**，例如顶点颜色解码元数据 `ColorMode`、`ColorMin` 和 `ColorBits`，顶点 UV 解码元数据 `UVs`，以及骨骼解码元数据 `BoneInfluence`；**最后是 `GpuSizes`，它记录当前 cluster 写进 GPU page 时，各个数据段需要多少字节**。
+
+Nanite 首先计算运行时 GPU page 中索引数据的布局。需要注意的是，**这里计算的是 cluster 加载到 GPU Page 后，三角形索引数据在运行时数据结构中占用的固定大小，而不是磁盘上 `StripIndexData` 的实际压缩大小**：
+
+```cpp
+// 根据当前 cluster 顶点数量, 计算运行时 GPU page 中单个顶点索引值至少需要多少 bit 数
+const uint32 BitsPerIndex = NumClusterVerts > 1 && NumClusterTris > 1 ? (FGenericPlatformMath::FloorLog2(NumClusterVerts - 1) + 1) : 1;
+// Cluster 被加载到 GPU page 时, 磁盘上的 Strip 索引会被解码并重新写成: 单个顶点索引值 + 两个 5-bit 顶点索引偏移值
+const uint32 BitsPerTriangle = BitsPerIndex + 2 * 5;    // Base index + two 5-bit offsets
+// 将运行时 GPU page 中单个顶点索引的 bit 数保存到 FEncodingInfo
+Info.BitsPerIndex = BitsPerIndex;
+```
+
+根据当前 cluster 的总顶点数可以知道其最大顶点索引值，通过最大索引值就可以确定运行时 GPU page 中单个顶点索引值至少所需的 bit 数。例如当前 cluster 一共有 128 个顶点，那么其最大顶点索引值就是 127，也就表示单个顶点索引值至少需要 7 bits。
+
+Cluster 加载到 GPU page 后会使用固定长度的三角形索引结构：1 个基础顶点索引 `BaseIndex`，加上 2 个相对 `BaseIndex` 的 5-bit 顶点索引偏移值。因此，在 GPU page 中单个三角形索引数据需要 `BitsPerIndex + 2 * 5` bits。
+
+然后在 `Info.GpuSizes` 中记录 GPU page 中各个数据段大小：
+
+```cpp
+FPageSections& GpuSizes = Info.GpuSizes;
+// 每个 cluster 的固定头信息大小
+GpuSizes.Cluster = sizeof(FPackedCluster);
+// 材质表大小: 如果 cluster 材质段数量超过 3, 此时材质段信息不能通过 fast path 内联表达, 需要额外的材质表数据
+GpuSizes.MaterialTable = CalcMaterialTableSize(Cluster) * sizeof(uint32);
+// 材质段 batch 信息大小: 如果当前 cluster 存在三角形且材质段数量超过 3, 则需要额外的材质段 batch 信息; 否则为 0
+GpuSizes.VertReuseBatchInfo = Cluster.NumTris && Cluster.MaterialRanges.Num() > 3 ? CalcVertReuseBatchInfoSize(Cluster.MaterialRanges) * sizeof(uint32) : 0;
+// DecodeInfo 中保存解码所需的辅助头信息: 每个 UV 通道的解码头信; 如果有骨骼数据, 还需要 BoneInfluence 的解码头信息
+GpuSizes.DecodeInfo = Cluster.Verts.Format.NumTexCoords * sizeof(FPackedUVHeader) + (MaxBones > 0 ? sizeof(FPackedBoneInfluenceHeader) : 0);
+// GPU page 中三角形索引 bitstream 的字节数: 每个三角形占 BitsPerTriangle bits, 向上取整到 32-bit 边界
+GpuSizes.Index = (NumClusterTris * BitsPerTriangle + 31) / 32 * 4;
+```
+
+这里额外分别说说 `MaterialTable` 和 `VertReuseBatchInfo` 编码的 slow path 和 fast path：
+
+先来看看材质表（`MaterialTable`）。**对于材质段数量不超过 3 的 cluster，Nanite 会将其材质段信息直接编码进 `PackedCluster.PackedMaterialInfo` 这个 `uint32` 中**，Nanite 将其叫做 fast path：
+
+```cpp
+PackedMaterialInfo = PackMaterialFastPath(Material0Length, Material0Index, Material1Length, Material1Index, Material2Index);
+```
+
+因为 Nanite 中每个 cluster 的最大材质数量是 `64 (NANITE_MAX_CLUSTER_MATERIALS)`，也就是说每个 cluster 使用到的材质的索引范围是 `[0, 63]`，那么每个材质段中记录的材质索引用使用 6 bits 就可以编码：
+
+```cpp
+// 每个材质段中记录的材质索引小于 64
+check(Material0Index  <  64);
+check(Material1Index  <  64);
+check(Material2Index  <  64);
+// 每个材质索引各编码进 6 bits 中
+Packed |= Material0Index;
+Packed |= Material1Index << 6;
+Packed |= Material2Index << 12;
+```
+
+对于每个材质段的长度，首先我们知道，Nanite 中每个 cluster 的最大三角形数量是 `128 (NANITE_MAX_CLUSTER_TRIANGLES)`，另外在前面构建材质段信息时，**保证了每个材质段中的三角形数量大于 0，并且每个 cluster 中的所有材质段有按照其三角形数量进行降序排序**。那么先来看看 `Material0Length`，它的取值范围就是 `[1, 128]`，那么 `Material0Length - 1` 刚好可以编码进 7 bits 中：
+
+```cpp
+// Material0Length 的范围是 [1, 128]
+check(Material0Length >= 1);
+check(Material0Length <= 128);
+// 所以 (Material0Length - 1) 刚好可以编码进 7 bits 中
+Packed |= (Material0Length - 1u) << 18;
+```
+
+又因为材质段会按其三角形数量降序排序，所以 `Material1Length` 一定满足 `Material1Length <= Material0Length`，另外如果 `Material1Length` 大于 64，那么 `Material0Length` 也必须大于 64，此时前 2 个材质段中三角形数量总和已经超过 128，这与 Nanite 定义的每个 cluster 最多 128 个三角形矛盾，所以 `Material1Length` 的范围应该是 `[1, 64]`，也是可以编码进 7 bits 中：
+
+```cpp
+// 因为前面的排序逻辑, 所以 Material1Length 一定满足: Material1Length <= Material0Length
+// 又因为 cluster 最大 128 个三角形, 计算可得 Material1Length <= 64
+check(Material1Length <= 64);
+check(Material1Length <= Material0Length);
+// 对于 [1, 64] 的 Material1Length, 将其编码进最后的 7 bits 中
+Packed |= Material1Length << 25;
+```
+
+对于 `Material2Length` 则可以不编码，因为它可以通过总三角形数量与前 2 个材质段中三角形数量反推出来：
+
+```cpp
+Material2Length = Cluster.MaterialIndexes.Num() - Material0Length - Material1Length;
+```
+
+而**对于材质段数量超过 3 的 cluster，Nanite 会将其每个材质段信息编码进全局的材质表中，并在 `PackedCluster.PackedMaterialInfo` 这个 `uint32` 中编码前 cluster 的材质段信息在运行时 GPU page 的材质表数据段中的起始 DWORD 偏移和材质段数量**，Nanite 将其叫做 slow path：
+
+```cpp
+// 把当前 GPU page 中材质表数据段的起始 byte 偏移转换成 DWORD 偏移
+const uint32 MaterialTableStartOffsetInDwords = Page.GpuSizes.GetMaterialTableOffset() >> 2;
+```
+
+首先把当前 GPU page 中材质表数据段的起始 byte 偏移转换成 DWORD 偏移，然后在 `PackMaterialInfo()` 方法中，先将每个材质段信息编码进一个 `uint32`，并添加进 `Streams.MaterialRange` 数组中：
+
+```cpp
+// 当前 GPU page 中材质表数据段的起始 DWORD 偏移
+uint32 MaterialTableOffset = OutMaterialTable.Num() + MaterialTableStartOffset;
+// 当前 cluster 材质段数量
+uint32 MaterialTableLength = Cluster.MaterialRanges.Num();
+check(MaterialTableLength > 0);
+
+// 将每个材质段信息编码进一个 `uint32`，并添加进 `Streams.MaterialRange` 数组中
+for (int32 RangeIndex = 0; RangeIndex < Cluster.MaterialRanges.Num(); ++RangeIndex)
+{
+    const FMaterialRange& Material = Cluster.MaterialRanges[RangeIndex];
+    OutMaterialTable.Add(PackMaterialTableRange(Material.RangeStart, Material.RangeLength, Material.MaterialIndex));
+}
+```
+
+也就是说 `Streams.MaterialRange` 中的每个 `uint32` 表示的是一个材质段信息，从低位开始，bit 0 到 bit 7 编码 `RangeStart`；bit 8 到 bit 15编码 `RangeLength`；bit 16 到 bit 21 编码 `MaterialIndex`，剩下的 10 bits 是 Padding。
+
+最后把当前 cluster 的材质段信息在运行时 GPU page 的材质表数据段中的起始 DWORD 偏移和材质段数量编码进 `PackedCluster.PackedMaterialInfo` 这个 `uint32` 中：
+
+```cpp
+PackedMaterialInfo = PackMaterialSlowPath(MaterialTableOffset, MaterialTableLength);
+```
+
+```cpp
+// 19 bits 编码起始 DWORD 偏移
+uint32 Packed = MaterialTableOffset;
+// 6 bits 编码材质段数量-1
+Packed |= (MaterialTableLength - 1u) << 19;
+// 高 7 bits 编码 slow path 标记, 这里是吧 bit 25 到 bit 31 全部设置为 1
+Packed |= (0xFE000000u);
+```
+
+需要注意的是，Nanite 在这里将 `PackedCluster.PackedMaterialInfo` 的高 7 bits 全部设置为 1 作为 slow path 的标记。因为当 cluster 的材质段数量不超过 3 时，fast path 会直接将 3 个材质段的信息编码进 `PackedCluster.PackedMaterialInfo` 中，此时其高 7 bits 编码的是 `Material1Length`，这个值最大只会是 64。所以在运行时 shader 在解码时可以通过一个阈值判断知道当前 cluster 的材质段信息编码是走的 slow path 还是 fast path：
+
+```hlsl
+if (MaterialEncoding < 0xFE000000u)
+    // Fast path decoding
+else
+    // Slow path decoding
+```
+
+再来看看材质段 batch 信息（`VertReuseBatchInfo`）。首先来来看看 `CalcVertReuseBatchInfoSize()` 方法，它的核心逻辑是计算编码当前 cluster 的材质段 batch 信息需要多少个 `uint32`：
+
+```cpp
+uint32 CalcVertReuseBatchInfoSize(const TArrayView<const FMaterialRange>& MaterialRanges)
+{
+    // 每个材质段的 batch 数量用 4 bits 编码
+    constexpr int32 NumBatchCountBits = 4;
+    // 每个 batch 的三角形数量用 5 bits 编码
+    constexpr int32 NumTriCountBits = 5;
+    // 最坏情况下一个 batch 中的三角形数量, 因为构建 batch 时要求//todo
+    constexpr int32 WorstCaseFullBatchTriCount = 10;
+
+    int32 TotalNumBatches = 0;
+    int32 NumBitsNeeded = 0;
+
+    for (const FMaterialRange& MaterialRange : MaterialRanges)
+    {
+        const int32 NumBatches = MaterialRange.BatchTriCounts.Num();
+        check(NumBatches > 0 && NumBatches < (1 << NumBatchCountBits));
+        TotalNumBatches += NumBatches;
+        NumBitsNeeded += NumBatchCountBits + NumBatches * NumTriCountBits;
+    }
+    NumBitsNeeded += FMath::Max(NumBatchCountBits * (3 - MaterialRanges.Num()), 0);
+    check(TotalNumBatches < FMath::DivideAndRoundUp(NANITE_MAX_CLUSTER_TRIANGLES, WorstCaseFullBatchTriCount) + MaterialRanges.Num() - 1);
+
+    return FMath::DivideAndRoundUp(NumBitsNeeded, 32);
+}
+```
+
+**对于材质段数量不超过 3 的 cluster，Nanite 会将其材质段 batch 信息直接编码进 `PackedCluster.VertReuseBatchInfo` 这个长度为 4 的 `uint32` 数组中**，
+
+而对于材质段数量超过 3 的 cluster，Nanite 会将
+
+---
+
+接下来 Nanite 继续计算顶点数据相关的编码信息。
 
 ## 3. References
 
 - [Nanite: A Deep Dive](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
 - [GAMES 104: GPU-Driven Geometry Pipeline - Nanite](https://www.piccoloengine.com/merch/8)
-
----
-
-<!-- [@superpowers](plugin://superpowers@openai-curated-remote) [NaniteEncode.cpp](Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp) [NaniteEncodeGeometryData.cpp](Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp) [2026-06-10-Nanite-EncodeClusterDAG.md](Engine/AIStuffs/2026-06-10-Nanite-EncodeClusterDAG.md)先了解整体源码以及md笔记，再详细分析下CalculateEncodingInfo方法中的核心逻辑，它主要是在做什么。回答的风格参考md笔记
-
-### 2.1. 计算 Cluster 编码信息
-
-源码入口在 [NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:1245)，前面已经完成了 position 量化、bone weight 量化、材质 range 统计等准备工作，然后 Nanite 会并行为每个 cluster 调用 `CalculateEncodingInfo()`：
-
-```cpp
-CalculateEncodingInfos(EncodingInfos, ClusterDAG.Clusters,
-    Resources.NormalPrecision,
-    Resources.TangentPrecision,
-    BoneWeightPrecision);
-```
-
-`CalculateEncodingInfo()` 的核心作用可以概括为一句话：
-
-**它并不真正写入 cluster 的几何数据，而是先为当前 cluster 计算“后续应该怎么编码”和“编码后每个 GPU page section 需要多少字节”。**
-
-也就是说，它产出的 `FEncodingInfo` 是后续 Page 分配、Cluster Header 打包、DecodeInfo 写入、GeometryData 编码共同依赖的一份“编码说明书”。
-
-### 1. 先计算 Index 编码规格
-
-源码位置：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:344)
-
-```cpp
-const uint32 BitsPerIndex =
-    NumClusterVerts > 1 && NumClusterTris > 1
-    ? FloorLog2(NumClusterVerts - 1) + 1
-    : 1;
-
-const uint32 BitsPerTriangle = BitsPerIndex + 2 * 5;
-```
-
-这里的逻辑是：cluster 内顶点数量越少，三角形索引需要的 bit 数也越少。比如一个 cluster 只有 64 个顶点，那么每个顶点 index 只需要 6 bits。
-
-`BitsPerTriangle = BitsPerIndex + 2 * 5` 表示每个三角形编码为：
-
-```text
-base vertex index + 两个 5-bit offset
-```
-
-因此 `Info.BitsPerIndex` 后续会写入 `FPackedCluster`，GPU 解码时就知道 index bitstream 里每个 base index 应该读多少 bit。
-
-### 2. 计算当前 Cluster 在 GPU Page 中的各段大小
-
-接着会填充 `Info.GpuSizes`：
-
-```cpp
-GpuSizes.Cluster = sizeof(FPackedCluster);
-GpuSizes.MaterialTable = CalcMaterialTableSize(Cluster) * sizeof(uint32);
-GpuSizes.VertReuseBatchInfo = ...;
-GpuSizes.DecodeInfo = NumTexCoords * sizeof(FPackedUVHeader)
-                    + optional bone header;
-GpuSizes.Index = AlignToDword(NumClusterTris * BitsPerTriangle);
-GpuSizes.BrickData = Cluster.Bricks.Num() * sizeof(FPackedBrick);
-```
-
-这些 size 非常关键。后续 `AssignClustersToPages()` 会直接累加 `EncodingInfo.GpuSizes` 来判断当前 page 还能不能放下这个 cluster：[NaniteEncodePageAssignment.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodePageAssignment.cpp:89)
-
-所以这里本质上是在提前给每个 cluster 算一笔“显存账本”。
-
-### 3. 计算 Attribute 每顶点需要多少 bit
-
-压缩路径下，`BitsPerAttribute` 会从 normal 开始累加：
-
-```cpp
-Info.BitsPerAttribute = 2 * NormalPrecision;
-```
-
-Normal 使用 octahedron 编码，所以只需要两个分量，每个分量 `NormalPrecision` bits。
-
-如果 cluster 有 tangent：
-
-```cpp
-Info.BitsPerAttribute += 1 + TangentPrecision;
-```
-
-这里多出来的 `1` 是 tangent Y sign，`TangentPrecision` 是 tangent angle 的量化 bit 数。
-
-### 4. 根据 Cluster 内颜色范围决定 Color 编码
-
-默认情况下：
-
-```cpp
-Info.ColorMode = CONSTANT;
-Info.ColorMin = (255,255,255,255);
-```
-
-如果 cluster 有 vertex color，Nanite 会遍历所有顶点，统计 RGBA 每个通道的最小值和最大值，然后计算每个通道实际需要多少 bit：
-
-```cpp
-ColorDelta = ColorMax - ColorMin;
-R_Bits = CeilLogTwo(ColorDelta.R + 1);
-...
-Info.ColorMin = ColorMin;
-Info.ColorBits = (R_Bits, G_Bits, B_Bits, A_Bits);
-```
-
-这里的思想是 cluster-local range encoding：  
-不是直接为 RGBA 固定写 8 bits，而是先保存 `ColorMin`，实际编码时只写 `Color - ColorMin`。如果某个通道在整个 cluster 中都是常量，那么它需要的 bit 数就是 0。
-
-后续 `EncodeGeometryData()` 会用这些信息真正写 color delta：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:806)
-
-### 5. 根据每个 UV 通道的范围决定 UV 编码
-
-UV 的处理和 Color 类似，但会先把 float UV 编码成一种可排序的整数格式：
-
-```cpp
-EncodedU = EncodeUVFloat(UV.X, NumMantissaBits);
-EncodedV = EncodeUVFloat(UV.Y, NumMantissaBits);
-```
-
-然后统计当前 cluster 中该 UV 通道的 `UVMin / UVMax`，计算 U/V 分量分别需要多少 bit：
-
-```cpp
-UVInfo.Min = UVMin;
-UVInfo.NumBits.X = CeilLogTwo(UVDelta.X + 1);
-UVInfo.NumBits.Y = CeilLogTwo(UVDelta.Y + 1);
-```
-
-后续真正写 UV 时，会重新 `EncodeUVFloat()`，再减去 `UVInfo.Min`，只写 cluster-local offset：[NaniteEncodeGeometryData.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeGeometryData.cpp:665)
-
-### 6. 如果有 Skinning，计算骨骼影响编码信息
-
-如果 `MaxBones > 0`，它会调用 `CalculateInfluences()`：
-
-```cpp
-CalculateInfluences(Info.BoneInfluence, Cluster, BoneWeightPrecision);
-```
-
-这一步会统计：
-
-```text
-NumVertexBoneInfluences
-NumVertexBoneIndexBits
-NumVertexBoneWeightBits
-ClusterBoneInfluences
-VoxelBoneInfluences
-BrickBoneIndices
-```
-
-然后根据每个顶点需要写多少个 influence，以及每个 influence 的 bone index / weight 需要多少 bit，计算 `GpuSizes.BoneInfluence`。
-
-这里需要注意：`BoneWeightPrecision` 只控制 weight bit 数；bone index bit 数是根据当前 cluster 实际出现的最大 bone index 算出来的。
-
-### 7. 最后计算 Position / Attribute Stream 大小
-
-前面 position 已经在 `CalculateQuantizedPositionsUniformGrid()` 中量化好了，所以这里直接使用 cluster 已经记录的：
-
-```cpp
-Cluster.QuantizedPosBits.X/Y/Z
-```
-
-计算每个顶点 position 的 bit 数：
-
-```cpp
-PositionBitsPerVertex =
-    QuantizedPosBits.X +
-    QuantizedPosBits.Y +
-    QuantizedPosBits.Z;
-
-GpuSizes.Position =
-    AlignToDword(NumPositions * PositionBitsPerVertex);
-
-GpuSizes.Attribute =
-    AlignToDword(NumClusterVerts * Info.BitsPerAttribute);
-```
-
-所以 `CalculateEncodingInfo()` 最终会同时确定：
-
-```text
-当前 cluster 的解码参数
-当前 cluster 的各数据段 GPU 字节大小
-当前 cluster 写入 page 时需要的 offset 推进量
-```
-
-### 8. 这些信息后续怎么被使用
-
-`PackCluster()` 会把 `BitsPerIndex`、`BitsPerAttribute`、normal/tangent precision、color bits、UV bit offset 等写入 `FPackedCluster`：[NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:126)
-
-`WritePages()` 会根据 `EncodingInfo.GpuSizes` 推进每个 section 的 offset，并把这些 offset 写入 cluster header：[NaniteEncode.cpp](/Users/czw/Desktop/UnrealEngine/Engine/Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp:604)
-
-`EncodeGeometryData()` 会按照 `FEncodingInfo` 中记录的 bit 数、min 值、precision 等，真正把 position、normal、tangent、color、UV、bone influence 写入 byte streams。
-
-### 小结
-
-`CalculateEncodingInfo()` 可以理解为 Nanite 编码阶段里的 **per-cluster 编码预分析**。
-
-它主要做三件事：
-
-1. **决定怎么编码**：index 几 bit、normal/tangent 几 bit、color/UV 是否需要 range encoding、bone influence 怎么写。
-2. **决定写多大**：计算 cluster header、material table、decode info、index、position、attribute、bone、brick 等 GPU section 的字节数。
-3. **服务后续流程**：Page 分配靠它判断容量，PackCluster 靠它写 decode metadata，EncodeGeometryData 靠它真正生成压缩后的几何数据。 -->
