@@ -14,6 +14,7 @@ category: Unreal Engine
   - [1.6. 量化 Cluster 顶点 BoneWeight](#16-量化-cluster-顶点-boneweight)
 - [2. 编码 Cluster DAG](#2-编码-cluster-dag)
   - [2.1. 计算 Cluster 编码信息和 GPU Page 数据大小](#21-计算-cluster-编码信息和-gpu-page-数据大小)
+  - [2.2. 计算 Root Page 数量上限并将 Cluster 分配到 GPU Page](#22-计算-root-page-数量上限并将-cluster-分配到-gpu-page)
 - [3. References](#3-references)
 
 本篇笔记是 Unreal Engine 的 Nanite 系统中关于编码 Cluster DAG 数据的源码分析理解，基于引擎版本 5.7.3 release。
@@ -1483,7 +1484,7 @@ static void QuantizeBoneWeights(FCluster& Cluster, int32 BoneWeightPrecision)
 {
     // 当前 cluster 顶点数
     const uint32 NumVerts           = Cluster.Verts.Num();
-    // 当前 cluster 顶点格式中最多支持的 BoneInfluence 数量
+    // 当前 cluster 的顶点格式中最多支持的 BoneInfluence 数量
     const uint32 NumBoneInfluences  = Cluster.Verts.Format.NumBoneInfluences;
 
     // 根据量化精度计算量化后的目标总权重, 如果 BoneWeightPrecision = 8, 那么 TargetTotalBoneWeight = (1 << 8) - 1 = 255
@@ -1718,7 +1719,7 @@ Packed |= Material1Length << 25;
 Material2Length = Cluster.MaterialIndexes.Num() - Material0Length - Material1Length;
 ```
 
-而**对于材质段数量超过 3 的 cluster，Nanite 会将其每个材质段信息编码进全局的材质表中，并在 `PackedCluster.PackedMaterialInfo` 这个 `uint32` 中编码前 cluster 的材质段信息在运行时 GPU page 的材质表数据段中的起始 DWORD 偏移和材质段数量**，Nanite 将其叫做 slow path：
+而**对于材质段数量超过 3 的 cluster，Nanite 会将其每个材质段信息编码进运行时 GPU page 的材质表数据段中，并在 `PackedCluster.PackedMaterialInfo` 这个 `uint32` 中编码当前 cluster 的材质段信息在运行时 GPU page 的材质表数据段中的起始 DWORD 偏移和材质段数量**，Nanite 将其叫做 slow path：
 
 ```cpp
 // 把当前 GPU page 中材质表数据段的起始 byte 偏移转换成 DWORD 偏移
@@ -1768,42 +1769,1084 @@ else
     // Slow path decoding
 ```
 
-再来看看材质段 batch 信息（`VertReuseBatchInfo`）。首先来来看看 `CalcVertReuseBatchInfoSize()` 方法，它的核心逻辑是计算编码当前 cluster 的材质段 batch 信息需要多少个 `uint32`：
+再来看看材质段 batch 信息（`VertReuseBatchInfo`）。首先说说 `CalcVertReuseBatchInfoSize()` 方法，它的核心逻辑是计算编码当前 cluster 的材质段 batch 信息需要多少个 `uint32`：
 
 ```cpp
 uint32 CalcVertReuseBatchInfoSize(const TArrayView<const FMaterialRange>& MaterialRanges)
 {
-    // 每个材质段的 batch 数量用 4 bits 编码
+    // 每个材质段的 batch 数量用 4 bits 编码, 因此单个材质段最多可以表示 15 个 batch
     constexpr int32 NumBatchCountBits = 4;
-    // 每个 batch 的三角形数量用 5 bits 编码
+    // 每个 batch 的三角形数量用 5 bits 编码, 实际编码的是 BatchTriCount - 1, 因此可以表示 1 ~ 32 个三角形
     constexpr int32 NumTriCountBits = 5;
-    // 最坏情况下一个 batch 中的三角形数量, 因为构建 batch 时要求//todo
+    // 最坏情况下, 如果 batch 是因为唯一顶点数量达到上限而被切分, 那么一个满 batch 至少可以容纳 10 个三角形
     constexpr int32 WorstCaseFullBatchTriCount = 10;
 
+    // 当前 cluster 所有材质段的 batch 总数
     int32 TotalNumBatches = 0;
+    // 编码所有材质段 batch 信息一共需要多少 bits
     int32 NumBitsNeeded = 0;
 
     for (const FMaterialRange& MaterialRange : MaterialRanges)
     {
+        // 当前材质段被切分成多少个 batch
         const int32 NumBatches = MaterialRange.BatchTriCounts.Num();
+        // 每个材质段的 batch 数量用 4 bits 编码, NumBatches 必须在 1 ～ 15 范围内
         check(NumBatches > 0 && NumBatches < (1 << NumBatchCountBits));
+        // 累加当前 cluster 的 batch 总数
         TotalNumBatches += NumBatches;
+        // 当前材质段 batch 信息需要编码 2 类信息:
+        //   1. 当前材质段的 batch 数量: (NumBatchCountBits) bits
+        //   2. 当前材质段中每个 batch 的三角形数量: (NumBatches * NumTriCountBits) bits
         NumBitsNeeded += NumBatchCountBits + NumBatches * NumTriCountBits;
     }
+    // 材质段 batch 信息至少按 3 个材质段预留空间, 即使当前 cluster 只有 1 或 2 个材质段, 也会补齐到 3 个材质段 batch 信息的空间大小
     NumBitsNeeded += FMath::Max(NumBatchCountBits * (3 - MaterialRanges.Num()), 0);
+
+    // 检查 batch 总数是否在合理范围内:
+    // 一个 cluster 最多有 NANITE_MAX_CLUSTER_TRIANGLES 个三角形; 在最坏情况下一个 batch 至少能容纳 10 个三角形, 因此 batch 总数大致不会超过 ceil(NANITE_MAX_CLUSTER_TRIANGLES / 10)
+    // 另外, 每个材质段都会独立切分 batch, 相邻材质段之间的 batch 不能合并: N 个材质段之间有 N - 1 个边界, 因此最多可能额外产生 (MaterialRanges.Num() - 1) 个不满的尾部 batch
     check(TotalNumBatches < FMath::DivideAndRoundUp(NANITE_MAX_CLUSTER_TRIANGLES, WorstCaseFullBatchTriCount) + MaterialRanges.Num() - 1);
 
+    // 返回保存 NumBitsNeeded 个 bits 所需的 uint32 数量
     return FMath::DivideAndRoundUp(NumBitsNeeded, 32);
 }
 ```
 
-**对于材质段数量不超过 3 的 cluster，Nanite 会将其材质段 batch 信息直接编码进 `PackedCluster.VertReuseBatchInfo` 这个长度为 4 的 `uint32` 数组中**，
+`PackVertReuseBatchInfo()` 方法则是把当前 cluster 的所有材质段的 batch 信息编码成一个紧凑的 bitstream：
 
-而对于材质段数量超过 3 的 cluster，Nanite 会将
+```cpp
+void PackVertReuseBatchInfo(const TArrayView<const FMaterialRange>& MaterialRanges, TArray<uint32>& OutVertReuseBatchInfo)
+{
+    // 每个材质段的 batch 数量用 4 bits 编码, 因此单个材质段最多可以表示 15 个 batch
+    constexpr int32 NumBatchCountBits = 4;
+    // 每个 batch 的三角形数量用 5 bits 编码, 实际编码的是 BatchTriCount - 1, 因此可以表示 1 ~ 32 个三角形
+    constexpr int32 NumTriCountBits = 5;
 
-接下来 Nanite 继续计算顶点数据相关的编码信息。
+    auto AppendBits = [](uint32*& DwordPtr, uint32& BitOffset, uint32 Bits, uint32 NumBits)
+    {
+        // 当前 DWORD 里还能写多少 bits
+        uint32 BitsConsumed = FMath::Min(NumBits, 32u - BitOffset);
+        // 把要写入的 Bits 的低 BitsConsumed 位写入当前 DWORD 的 BitOffset 位置
+        SetBits(*DwordPtr, (Bits & ((1 << BitsConsumed) - 1)), BitsConsumed, BitOffset);
+        // 更新当前 DWORD 内的写入偏移 BitOffset
+        BitOffset += BitsConsumed;
+        // 检查当前 DWORD 是否写满, 因为前面计算 BitsConsumed 时已经用 Min 限制过了, 所以最多刚好写到 32
+        if (BitOffset >= 32u)
+        {
+            // 确认写入偏移刚好等于 32
+            check(BitOffset == 32u);
+            // 指针移动到下一个 uint32
+            ++DwordPtr;
+            // 将写入偏移重置到下一个 DWORD 内的位置
+            BitOffset -= 32u;
+        }
+        // 判断刚才是否只写了 Bits 的一部分
+        if (BitsConsumed < NumBits)
+        {
+            // 丢掉已经写入的低位部分
+            Bits >>= BitsConsumed;
+            // 剩余还需要写多少 bits
+            BitsConsumed = NumBits - BitsConsumed;
+            // 把剩余 bits 写入新的 DOWRD 内
+            SetBits(*DwordPtr, Bits, BitsConsumed, BitOffset);
+            // 更新新 DOWRD 的写入偏移
+            BitOffset += BitsConsumed;
+            // 确认往新 DWORD 中写完剩余 bits 后, 没有再次写满
+            check(BitOffset < 32u);
+        }
+    };
+
+    // 编码当期 cluster 的材质段 batch 信息需要多少个 DWORD
+    const uint32 NumDwordsNeeded = CalcVertReuseBatchInfoSize(MaterialRanges);
+    // 清空输出数组 OutVertReuseBatchInfo 并填充 0
+    OutVertReuseBatchInfo.Empty(NumDwordsNeeded);
+    OutVertReuseBatchInfo.AddZeroed(NumDwordsNeeded);
+
+    // 材质段 batch 信息 bitstream 分成 2 段:
+    // [ 每个材质段的 batch 数量表 ][ 所有 batch 的三角形数量表 ]
+
+    // 第 1 个指针从 bit 0 开始, 连续写每个材质段的 NumBatches, 每个 NumBatches 占 4 bits
+    uint32* NumArrayDwordPtr = &OutVertReuseBatchInfo[0];
+    uint32 NumArrayBitOffset = 0;
+
+    // bitstream 中的 [ 每个材质段的 batch 数量表 ] 数据段长度至少按 3 个材质段算
+    const uint32 NumArrayBits = FMath::Max(MaterialRanges.Num(), 3) * NumBatchCountBits;
+
+    // 第 2 个指针从 [ 每个材质段的 batch 数量表 ] 之后开始, 连续写所有 batch 的 (BatchTriCount - 1), 每个 (BatchTriCount - 1) 占 5 bits
+    uint32* TriCountDwordPtr = &OutVertReuseBatchInfo[NumArrayBits >> 5];
+    uint32 TriCountBitOffset = NumArrayBits & 0x1f;
+
+    for (const FMaterialRange& MaterialRange : MaterialRanges)
+    {
+        const uint32 NumBatches = MaterialRange.BatchTriCounts.Num();
+        check(NumBatches > 0);
+        // 通过第 1 个指针向 bitstream 写每个材质段的 NumBatches
+        AppendBits(NumArrayDwordPtr, NumArrayBitOffset, NumBatches, NumBatchCountBits);
+
+        for (int32 BatchIndex = 0; BatchIndex < MaterialRange.BatchTriCounts.Num(); ++BatchIndex)
+        {
+            const uint32 BatchTriCount = MaterialRange.BatchTriCounts[BatchIndex];
+            check(BatchTriCount > 0 && BatchTriCount - 1 < (1 << NumTriCountBits));
+            // 通过第 2 个指针向 bitstream 中写每个 batch 的 (BatchTriCount - 1)
+            AppendBits(TriCountDwordPtr, TriCountBitOffset, BatchTriCount - 1, NumTriCountBits);
+        }
+    }
+}
+```
+
+**当一个 cluster 内的材质段数量不超过 3 时，Nanite 会将其材质段 batch 信息 bitstream 直接编码进 `PackedCluster.VertReuseBatchInfo` 这个长度为 4 的 `uint32` 数组中**：
+
+```cpp
+// 清空 PackedCluster.VertReuseBatchInfo 中的旧数据
+FMemory::Memzero(VertReuseBatchInfo, sizeof(VertReuseBatchInfo));
+// 如果材质段数量不超过 3
+if (NumMaterialRanges <= 3)
+{
+    // 确认材质段 batch 信息 bitstream 的大小不会超过 4 个 uint32
+    check(BatchInfo.Num() <= 4);
+    // 把 bitstream 直接拷贝到 PackedCluster.VertReuseBatchInfo 中
+    FMemory::Memcpy(VertReuseBatchInfo, BatchInfo.GetData(), BatchInfo.Num() * sizeof(uint32));
+}
+```
+
+`PackedCluster.VertReuseBatchInfo` 是一个长度为 4 的 `uint32` 数组，它一共有 128 bits。而根据上面的源码分析我们知道，通过 `PackVertReuseBatchInfo()` 方法编码的材质段 batch 信息 bitsteam 包含 2 类信息：
+
+1. 每个材质段的 batch 数量表：每个材质段的 batch 数量用 4 bits 编码；
+2. 所有 batch 的三角形数量表：每个 batch 的三角形数量用 5 bits 编码；
+
+当材质段数量不超过 3 时，每个材质段的 batch 数量表的大小固定按 3 个材质段预留，也就是 `3 * 4 = 12` bits；在每个 batch 都是因为唯一顶点数达到 32 被切分并且每个三角形都贡献 3 个新唯一顶点的最差情况下，每个 batch 至少包含 10 个三角形，而一个 cluster 最多有 128 个三角形，所以最多有 `ceil(128 / 10) = 13` 个 batch，另外考虑到切分 batch 时每个材质段都会独立切分，相邻材质段之间的 batch 不能合并，所以 3 个材质段的情况下额外还会产生 2 个不满限制的尾部 batch，此时所有 batch 的三角形数量表的大小也就是 `15 * 5 = 75` bits。总的来说，当材质段数量不超过 3 时，所有材质段 batch 信息 bitstream 最大也就 `75 + 12 = 87` bits，远小于 `PackedCluster.VertReuseBatchInfo` 的 128 bits。所以说 Nanite 直接将其编码进 `PackedCluster.VertReuseBatchInfo` 中也是合理的。
+
+而对于材质段数量超过 3 的 cluster，Nanite 会将其材质段 batch 信息 bitstream 编码进运行时 GPU page 的 batch 信息数据段中，并在 `PackedCluster.VertReuseBatchInfo` 中编码当前 cluster 的材质段 batch 信息在运行时 GPU page 的 batch 信息数据段中的起始 DWORD 偏移和材质段数量：
+
+```cpp
+TArray<uint32> LocalVertReuseBatchInfo;
+PackVertReuseBatchInfo(MakeArrayView(Cluster.MaterialRanges), LocalVertReuseBatchInfo);
+
+...
+
+if (Cluster.MaterialRanges.Num() > 3)
+{
+    // 将材质段 batch 信息 bitstream 编码进运行时 GPU page 的 batch 信息数据段中
+    Streams.VertReuseBatchInfo.Append(MoveTemp(LocalVertReuseBatchInfo));
+}
+```
+
+```cpp
+// 确保 GpuPageOffset 是 4 字节对齐的, 后面要把 byte 偏移转成 DWORD 偏移
+check((GpuPageOffset & 0x3) == 0);
+// PackedCluster.VertReuseBatchInfo[0] 编码当前 cluster 的材质段 batch 信息在 GPU page 内的 DWORD 偏移
+VertReuseBatchInfo[0] = GpuPageOffset >> 2;
+// PackedCluster.VertReuseBatchInfo[1] 编码当期 cluster 的材质段数量
+VertReuseBatchInfo[1] = NumMaterialRanges;
+```
+
+接下来 Nanite 继续计算顶点数据相关的编码信息（跳过非压缩路径的分析理解）。首先是顶点法线和顶点切线的编码 bit 数和量化精度：
+
+```cpp
+// 使用 octahedron 编码法线, 法线会被编码成 2 个分量, 所以一共需要 (2 * NormalPrecision) bits
+Info.BitsPerAttribute = 2 * NormalPrecision;
+
+// 如果有切线, TangentPrecision 是切线角度量化 bit 数, 额外 +1 是切线符号
+if (Cluster.Verts.Format.bHasTangents)
+{
+    Info.BitsPerAttribute += 1 + TangentPrecision;
+}
+
+// 把法线和切线精度保存到编码信息中
+Info.NormalPrecision = NormalPrecision;
+Info.TangentPrecision = TangentPrecision;
+```
+
+然后是顶点颜色的解码元数据与编码 bit 数：
+
+```cpp
+// 顶点颜色默认是 CONSTANT MODE
+Info.ColorMode = NANITE_VERTEX_COLOR_MODE_CONSTANT;
+// 顶点颜色默认是白色
+Info.ColorMin = FIntVector4(255, 255, 255, 255);
+// 如果有顶点颜色
+if (Cluster.Verts.Format.bHasColors)
+{
+    // 初始化当前 cluster 顶点颜色的 Min/Max
+    FIntVector4 ColorMin = FIntVector4( 255, 255, 255, 255);
+    FIntVector4 ColorMax = FIntVector4( 0, 0, 0, 0);
+    for (uint32 i = 0; i < NumClusterVerts; i++)
+    {
+        // 读取当前顶点颜色, 并转成 8-bit FColor
+        FColor Color = Cluster.Verts.GetColor(i).ToFColor(false);
+        // 统计 RGBA 四个通道的 Min/Max
+        ColorMin.X = FMath::Min(ColorMin.X, (int32)Color.R);
+        ColorMin.Y = FMath::Min(ColorMin.Y, (int32)Color.G);
+        ColorMin.Z = FMath::Min(ColorMin.Z, (int32)Color.B);
+        ColorMin.W = FMath::Min(ColorMin.W, (int32)Color.A);
+        ColorMax.X = FMath::Max(ColorMax.X, (int32)Color.R);
+        ColorMax.Y = FMath::Max(ColorMax.Y, (int32)Color.G);
+        ColorMax.Z = FMath::Max(ColorMax.Z, (int32)Color.B);
+        ColorMax.W = FMath::Max(ColorMax.W, (int32)Color.A);
+    }
+
+    // 计算每个颜色通道在当前 cluster 内的编码范围
+    const FIntVector4 ColorDelta = ColorMax - ColorMin;
+    // 根据编码范围计算每个颜色通道需要多少 bit 数
+    const int32 R_Bits = FMath::CeilLogTwo(ColorDelta.X + 1);
+    const int32 G_Bits = FMath::CeilLogTwo(ColorDelta.Y + 1);
+    const int32 B_Bits = FMath::CeilLogTwo(ColorDelta.Z + 1);
+    const int32 A_Bits = FMath::CeilLogTwo(ColorDelta.W + 1);
+    
+    // 顶点颜色属性需要的 bit 数
+    uint32 NumColorBits = R_Bits + G_Bits + B_Bits + A_Bits;
+    // 添加进每顶点属性需要的总 bit 数中
+    Info.BitsPerAttribute += NumColorBits;
+    // 记录顶点颜色解码所需元数据, 运行时会基于 (ColorMin + 编码的偏移) 解码顶点颜色
+    Info.ColorMin = ColorMin;
+    Info.ColorBits = FIntVector4(R_Bits, G_Bits, B_Bits, A_Bits);
+    // 如果 NumColorBits == 0, 说明所有顶点的颜色属性值完全一样, 此时不需要逐顶点写颜色属性, 保持 CONSTANT MODE; 否则修改为 VARIABLE MODE
+    if (NumColorBits > 0)
+    {
+        Info.ColorMode = NANITE_VERTEX_COLOR_MODE_VARIABLE;
+    }
+}
+```
+
+Nanite 会统计当前 cluster 内所有顶点颜色在 RGBA 每个通道上的最小值 `ColorMin` 和最大值 `ColorMax`，把 `ColorMin` 编码进 `Info.ColorMin`，并根据 `ColorMax - ColorMin` 计算每个通道需要的 bit 数 `Info.ColorBits`。
+
+如果颜色范围不为 0，则 `ColorMode` 为 `NANITE_VERTEX_COLOR_MODE_VARIABLE`，每个顶点颜色先表示成相对于 `Info.ColorMin` 的局部整数偏移值，随后在属性 bitstream 中写**当前顶点颜色偏移值相对于上一个顶点颜色偏移值的差值**；如果所有顶点颜色完全相同，或者当前 cluster 没有顶点颜色数据，则保持 `NANITE_VERTEX_COLOR_MODE_CONSTANT`，此时不写逐顶点颜色属性，解码时使用 `Info.ColorMin` 作为顶点颜色。
+
+接下来是顶点 UV 的解码元数据和编码 bit 数：
+
+```cpp
+// UV 使用自定义浮点格式编码, 这里取 UV 尾数 bit 数
+const int NumMantissaBits = NANITE_UV_FLOAT_NUM_MANTISSA_BITS;
+// 遍历每个 UV 通道
+for( uint32 UVIndex = 0; UVIndex < Cluster.Verts.Format.NumTexCoords; UVIndex++ )
+{
+    // 初始化当前 UV 通道的 Min/Max
+    FUintVector2 UVMin = FUintVector2(0xFFFFFFFFu, 0xFFFFFFFFu);
+    FUintVector2 UVMax = FUintVector2(0u, 0u);
+
+    for (uint32 i = 0; i < NumClusterVerts; i++)
+    {
+        // 读取当前顶点的当前 UV 通道
+        const FVector2f& UV = Cluster.Verts.GetUVs(i)[UVIndex];
+
+        // 把浮点 UV 编码成整数
+        // 这个编码有一个重要性质: 整数大小顺序和原始 UV 浮点大小顺序一致, 因此可以直接取 Min/Max
+        const uint32 EncodedU = EncodeUVFloat(UV.X, NumMantissaBits);
+        const uint32 EncodedV = EncodeUVFloat(UV.Y, NumMantissaBits);
+
+        // 统计当前 UV 通道的编码值的 Min/Max
+        UVMin.X = FMath::Min(UVMin.X, EncodedU);
+        UVMin.Y = FMath::Min(UVMin.Y, EncodedV);
+        UVMax.X = FMath::Max(UVMax.X, EncodedU);
+        UVMax.Y = FMath::Max(UVMax.Y, EncodedV);
+    }
+
+    // 计算每个 UV 通道在当前 cluster 内的编码范围
+    const FUintVector2 UVDelta = UVMax - UVMin;
+
+    FUVInfo& UVInfo = Info.UVs[UVIndex];
+    // 记录当前 UV 通道的 Min 编码值
+    UVInfo.Min              = UVMin;
+    // 计算并记录当前 UV 通道 U/V 分量各自需要多少 bit 数
+    UVInfo.NumBits.X        = FMath::CeilLogTwo(UVDelta.X + 1u);
+    UVInfo.NumBits.Y        = FMath::CeilLogTwo(UVDelta.Y + 1u);
+
+    // 添加进每顶点属性需要的总 bit 数中
+    Info.BitsPerAttribute   += UVInfo.NumBits.X + UVInfo.NumBits.Y;
+}
+```
+
+Nanite 编码 UV 使用了一种自定义浮点格式，先将 32-bit 浮点 UV 量化成一个可排序的编码值。这个格式在 `[0, 1]` 范围内提供均匀精度，并通过特殊的正负号编码保证编码后的 `uint32` 排序顺序与原浮点数值顺序一致。这样后续就可以在 cluster 内直接对编码值求 Min/Max，并把每个顶点 UV 存成相对于 Min 的局部偏移，从而用更少 bit 编码当前 cluster 的 UV 属性。在这里额外看看 Nanite 是怎么编码 UV 的，核心算法在 `EncodeUVFloat()` 方法中：
+
+```cpp
+static uint32 EncodeUVFloat(float Value, uint32 NumMantissaBits)
+{
+    // 检查输入必须是有限 float, 不能是 NaN 或 Inf
+    checkSlow(FMath::IsFinite(Value));
+
+    // 计算自定义 sign bit 的位置
+    // 在当前默认配置下, NumMantissaBits = 14, 因此 SignBitPosition = 5 + 14 = 19, 整个自定义 UV float 编码最多占 1 + 5 + 14 = 20 bits. 所以下面的 0x80000 和 0x7FFFF 都是基于当前 14-bit 尾数计算出来的
+    const uint32 SignBitPosition = NANITE_UV_FLOAT_NUM_EXPONENT_BITS + NumMantissaBits;
+    // 将原始 float 的 32-bit 原始二进制位重新解释成 uint32, 这里不是数值转换! 例如 1.0f 不会变成整数 1, 而是得到 1.0f 在 IEEE 754 单精度浮点格式中的原始二进制位模式 0x3F800000
+    const uint32 FloatUInt = (uint32&)Value;
+    // 取原始 float 的 8-bit 指数, 后续并没有直接使用此值
+    const uint32 Exponent = (FloatUInt >> 23) & 0xFFu;
+    // 取原始 float 的 23-bit 尾数, 后续并没有直接使用此值
+    const uint32 Mantissa = FloatUInt & 0x7FFFFFu;
+    // 清掉原始 float 的符号位, 也就是将 abs(Value) 的原始二进制位重新解释成 uint32
+    const uint32 AbsFloatUInt = FloatUInt & 0x7FFFFFFFu;
+
+    uint32 Result;
+    // 0x3F800000u 是 1.0f 的 IEEE 754 二进制位模式, 这里是判断 abs(Value) < 1.0f, 大部分情况下的 UV 都是走的 Denormal encoding path
+    if (AbsFloatUInt < 0x3F800000u)
+    {
+        // Denormal encoding path:
+        // 把去掉符号位后的二进制位重新解释回正数 float
+        const float AbsFloat = (float&)AbsFloatUInt;
+        // 等价于 Result = round(AbsFloat * 2^NumMantissaBits), 这里 + 0.5 是为了把 C++ 的截断转换变成四舍五入; double(...) 是为了保证加 0.5 这个舍入偏置时不被 float 精度吞掉
+        Result = uint32(double(AbsFloat * float(1u << NumMantissaBits)) + 0.5); // Cast to double to make sure +0.5 is lossless
+    }
+    else
+    {
+        // Normal encoding path:
+        // 计算需要右移的位数
+        const uint32 Shift = (23 - NumMantissaBits);
+        // 0x3F000000u 是 0.5f 的 IEEE 754 二进制位模式
+        // (AbsFloatUInt - 0x3F000000u) 是在做: 把 abs(Value) 的 IEEE float 位模式, 转换成相对于 0.5f 的编码偏移
+        // (1u << (Shift - 1)) 是在做: 在右移之前加半个量化单位, 把后面的 >> Shift 从向下取整变成四舍五入
+        const uint32 Tmp = (AbsFloatUInt - 0x3F000000u) + (1u << (Shift - 1));  // Bias to round to nearest
+        // 因为前面已经加了半个量化单位, 所以这里右移 Shift 位不是单纯向下截断, 而是把相对于 0.5f 的 float bit offset 四舍五入压缩成 Nanite 自定义 UV float 的绝对值编码; 最后还会把结果限制在 19 bits 能表示的最大范围内
+        Result = FMath::Min(Tmp >> Shift, (1u << SignBitPosition) - 1u);        // Clamp to largest UV float value
+    }
+
+    // (FloatUInt >> 31u): 取原始 float 的符号位. 正数: 0; 负数: 1
+    // 如果原始 float 是正数, SignMask 也就是 (1u << 19) - 0, 即是 0x80000; 如果原始 float 是负数, SignMask 也就是 (1u << 19) - 1, 即是 0x7FFFF;
+    const uint32 SignMask = (1u << SignBitPosition) - (FloatUInt >> 31u);
+    // 首先明确一点, 这里的 Result 还没有经过符号重排, 它只是 abs(Value) 对应的绝对值编码, 默认范围是: 0 .. 0x7FFFF
+    // 原始 float 是正数时, 此时 SignMask = 0x80000, 并且编码后的 Result 的 bit 19 一定是 0. 对一个 bit 19 为 0 的数异或 0x80000, 其实就是把 bit 19 反转为 1, 低 19 位保持不变;
+    // 原始 float 是负数时, 此时 SignMask = 0x7FFFF, 对编码后的 Result 异或 0x7FFFF, 其实就是把 Result 的低 19 位全部反转, 等价于 Result = 0x7FFFF - Result
+    Result ^= SignMask;
+
+    // 异或之后:
+    // 原始 float 是负数时, abs(Value) 越大, 那么编码后的 Result 越大, Result 异或 SignMask 之后, Result 越小, 这正好符合负数排序. 例如: -2.0f < -1.0f < -0.0f 正好对应 Result 0x77FFF < 0x7BFFF < 0x7FFFF;
+    // 原始 float 是正数时, 编码后的 Result 异或 SignMask 之后, Result >= 0x80000, 所以此时的 Result 都大于任何负数的 Result, 并且边界刚好是: -0.0f -> 0x7FFFF, +0.0f -> 0x80000;
+
+    // 通过这里的异或操作保证了编码后的 uint32 的大小顺序和原始 float 数值大小顺序一致, 这也就是 Nanite 后续可以通过求编码后 cluster 内 UV 的 Min/Max 值并做局部偏移压缩的原因
+
+#if DO_GUARD_SLOW
+    VerifyUVFloatEncoding(Value, Result, NumMantissaBits);
+#endif
+    return Result;
+}
+```
+
+可以看到，Nanite 首先会将原始 UV 的 32-bit 二进制位重新解释成 `uint32`，这里的重新解释不是数值转换，而是得到 IEEE 754 单精度浮点数的原始二进制位模式，例如：`1.0f` 重新解释成 `uint32` 后是 `0x3F800000`；然后通过 `FloatUInt & 0x7FFFFFFF` 清掉 IEEE float 的符号位，得到 `abs(Value)` 对应的 float bit pattern。这里不是对 `uint32` 数值取绝对值，而是在浮点位模式层面构造原始 UV 的绝对值版本。
+
+对于 `abs(Value) < 1.0f` 的 UV 值，走 Denormal Encoding：Nanite 直接根据量化精度 `NANITE_UV_FLOAT_NUM_MANTISSA_BITS ( 14 )` 将其量化到整数空间 `[0, 2^NANITE_UV_FLOAT_NUM_MANTISSA_BITS]`；而对于 `abs(Value) >= 1.0f` 的 UV 值，走 Normal Encoding：Nanite 先将其转换成相对于 0.5f 的编码偏移值 `Tmp`，然后对 `Tmp` 右移 `23 - NANITE_UV_FLOAT_NUM_MANTISSA_BITS ( 14 )` 位，将此偏移值四舍五入压缩成 Nanite 自定义 UV float 的绝对值编码。也就是说，对于绝对值在 `[0.0f, 1.0f)` 之间的 UV 值，Nanite 编码的是根据量化精度量化原始 UV 绝对值后的整数值；而对于绝对值 `>= 1.0f` 的 UV 值，Nanite 编码的是原始 UV 绝对值重新解释成 `uint32` 后，相对于 `0x3F000000u` 的整数偏移值，并且再将此偏移值压缩到自定义 UV float 的低 19-bit 绝对值编码区域内。
+
+最后，为了让编码后的整数大小顺序与原始 float 数值大小顺序一致，Nanite 可以通过求 cluster 内编码后的 UV 的 Min/Max 值并做局部偏移压缩。Nanite 会根据原始 UV 的正负性，对编码后的值再进行异或操作：当原始 UV 是正数时，异或操作会将编码后的值的 bit 19 反转为 1，低 19 位保持不变，也就是说编码后的 `Result >= 0x80000`；而当原始 UV 是负数时，异或操作会将编码后的值的低 19 位全部反转，这等价于 `Result = 0x7FFFF - Result`，也就是说编码后的 `Result <= 0x7FFFF`。
+
+如果有顶点骨骼数据，Nanite 接下来会计算解码骨骼数据相关的元数据和编码 bit 数。这部分逻辑主要发生在 `CalculateInfluences()` 中。
+
+由于前面 `QuantizeBoneWeights()` 已经把每个顶点的 BoneWeight 量化成整数并按权重从大到小排序，所以 Nanite 在遍历顶点 `BoneInfluences` 时，一旦遇到量化后的 BoneWeight 为 0，就可以认为当前顶点后面的 BoneInfluence 都是无效的。对于普通三角形 cluster，Nanite 会在这个过程中统计当前 cluster 内单个顶点最大有效 BoneInfluence 数 `MaxVertexInfluences`，以及当前 cluster 中出现过的最大 BoneIndex `MaxBoneIndex`，并在遍历结束后计算解码元数据并将其保存到 `InfluenceInfo` 中：
+
+```cpp
+// 保存当前 cluster 内单个顶点最大有效 BoneInfluence 数
+InfluenceInfo.NumVertexBoneInfluences  = MaxVertexInfluences;
+// 根据当前 cluster 中出现过的最大 BoneIndex 计算并保存编码 BoneIndex 需要的 bit 数
+InfluenceInfo.NumVertexBoneIndexBits   = FMath::CeilLogTwo(MaxBoneIndex + 1u);
+// 如果当前 cluster 的单个顶点最大有效 BoneInfluence 数是 1, 在 bitstream 中就不写 BoneWeight, 运行时 Shader 解码时默认 BoneWeight 为 1; 如果有多个 BoneInfluence 才按 BoneWeightPrecision 把 BoneWeight 写入 bitstream
+InfluenceInfo.NumVertexBoneWeightBits  = MaxVertexInfluences > 1 ? BoneWeightPrecision : 0u; // Drop bone weights if only one bone is used
+```
+
+其中，`InfluenceInfo.NumVertexBoneInfluences` 记录每个顶点固定编码的 BoneInfluence 数量；`InfluenceInfo.NumVertexBoneIndexBits` 是根据当前 cluster 内实际出现的最大 BoneIndex 动态确定编码 BoneIndex 需要的 bit 数；`InfluenceInfo.NumVertexBoneWeightBits` 则是记录编码 BoneWeight 需要的 bit 数，当 `InfluenceInfo.NumVertexBoneInfluences` 不大于 1 时，Nanite 不编码 BoneWeight，运行时 Shader 解码时直接把 BoneWeight 当作 1.0，此时 `InfluenceInfo.NumVertexBoneWeightBits` 为 0，否则 Nanite 使用 `BoneWeightPrecision` 指定的 bit 数编码 BoneWeight。
+
+除了逐顶点 BoneInfluence bitstream 的解码元数据外，`CalculateInfluences()` 还会额外维护一份 cluster 级别的 BoneIndex 列表 `InfluenceInfo.ClusterBoneInfluences`。每当 Nanite 读到一个有效 BoneIndex，就检查它是否已经出现在当前 cluster 的 `ClusterBoneInfluences` 列表中；如果没有出现过，并且当前列表中的 BoneIndex 数量尚未达到 `NANITE_MAX_CLUSTER_BONE_INFLUENCES`，就把这个 BoneIndex 作为一个新的 `FClusterBoneInfluence` 加入列表，核心代码如下：
+
+```cpp
+// 当前 BoneIndex 还没有记录到 InfluenceInfo.ClusterBoneInfluences 中
+if (!bFound)
+{
+    // InfluenceInfo.ClusterBoneInfluences 中的 BoneIndex 数量尚未达到 NANITE_MAX_CLUSTER_BONE_INFLUENCES
+    if (InfluenceInfo.ClusterBoneInfluences.Num() < NANITE_MAX_CLUSTER_BONE_INFLUENCES)
+    {
+        // 将当前 BoneIndex 添加到 InfluenceInfo.ClusterBoneInfluences 中
+        FClusterBoneInfluence ClusterBoneInfluence;
+        ClusterBoneInfluence.BoneIndex = BoneIndex;
+        InfluenceInfo.ClusterBoneInfluences.Add(ClusterBoneInfluence);
+    }
+    else
+    {
+        // InfluenceInfo.ClusterBoneInfluences 已达到上限, 并且当前又遇到了一个新的 BoneIndex, 清空并放弃维护 InfluenceInfo.ClusterBoneInfluences
+        bClusterBoneOverflow = true;
+        InfluenceInfo.ClusterBoneInfluences.Empty();
+    }
+}
+```
+
+需要注意的是，`InfluenceInfo.ClusterBoneInfluences` 并不是逐顶点 skinning 使用的数据，它只保存当前 cluster 内出现过的唯一 BoneIndex。真正用于顶点变形的 BoneIndex/BoneWeight 数据，后面会由 `EncodeGeometryData()` 按 `NumVertexBoneInfluences`、`NumVertexBoneIndexBits` 和 `NumVertexBoneWeightBits` 写入 `Streams.BoneInfluence` bitstream 中。
+
+维护 `InfluenceInfo.ClusterBoneInfluences` 的主要作用，是给运行时的 cluster bounds skinning/culling 使用，运行时 Nanite 在做 skinned cluster 的裁剪时，不能为了计算当前 cluster 的包围盒就逐顶点解码所有 BoneInfluence 并执行完整 skinning，这样成本太高。因此 **对于普通三角形 cluster，Nanite 在离线编码阶段提前为每个 cluster 记录一份这个 cluster 可能被哪些骨骼影响的唯一 BoneIndex 列表**，运行时 Shader 只需要遍历 `Cluster.NumClusterBoneInfluences` 个 BoneIndex，把当前 cluster 的原始 bounds 分别用这些骨骼矩阵变换，然后对所有变换后的 bounds 求并集，就可以得到一个保守的 skinned bounds。
+
+另外，当普通三角形 cluster 记录的唯一 BoneIndex 数量超过 `NANITE_MAX_CLUSTER_BONE_INFLUENCES` 上限时，Nanite 会清空 `InfluenceInfo.ClusterBoneInfluences`，使运行时解码出的 `Cluster.NumClusterBoneInfluences` 为 0。此时 Nanite 不会逐顶点解码 BoneInfluence 并执行完整 skinning，而是直接使用整个实例的 `InstanceData.LocalBoundsCenter` 和 `InstanceData.LocalBoundsExtent` 替代当前 cluster 的 bounds 参与裁剪。
+
+计算出每个顶点固定编码的 BoneInfluence 数，以及单个 BoneIndex 和 BoneWeight 各自所需的 bit 数后，Nanite 会计算当前 cluster 所有顶点的 BoneInfluence bitstream 写入运行时 GPU page 所需的总 bit 数，并将其向上对齐到 32-bit 边界得到总字节数，最后将结果记录到 `GpuSizes.BoneInfluence` 中：
+
+```cpp
+// 计算当前 cluster 所有顶点的 BoneInfluence bitstream 总字节数: ceil( ( cluster 顶点数 * 每个顶点固定编码的 BoneInfluence 数 * 每个 BoneInfluence 所需的 bit 数 ) / 32 ) * 4
+const uint32 VertexInfluenceSize    = ( NumClusterVerts * Info.BoneInfluence.NumVertexBoneInfluences * ( Info.BoneInfluence.NumVertexBoneIndexBits + Info.BoneInfluence.NumVertexBoneWeightBits ) + 31) / 32 * 4;
+GpuSizes.BoneInfluence              = VertexInfluenceSize;
+```
+
+最后，Nanite 会计算当前 cluster 所有顶点的 Position bitstream 和 Attribute bitstream 写入运行时 GPU page 所需的总 bit 数，然后分别向上对齐到 32-bit 边界得到总字节数，并将结果记录到 `GpuSizes` 中：
+
+```cpp
+// 单个顶点 Position 的 X/Y/Z 3 个分量总共需要的 bit 数
+const uint32 PositionBitsPerVertex = Cluster.QuantizedPosBits.X + Cluster.QuantizedPosBits.Y + Cluster.QuantizedPosBits.Z;
+// 计算 Position bitstream 总字节数: ceil( ( Position 数量 * 单个顶点 Position 的 bit 数 ) / 32 ) * 4
+GpuSizes.Position = (NumPositions * PositionBitsPerVertex + 31) / 32 * 4;
+// 计算 Attribute bitstream 总字节数: ceil( ( cluster 顶点数 * 单个顶点所有 Attribute 的总 bit 数 ) / 32 ) * 4
+GpuSizes.Attribute = (NumClusterVerts * Info.BitsPerAttribute + 31) / 32 * 4;
+```
+
+### 2.2. 计算 Root Page 数量上限并将 Cluster 分配到 GPU Page
+
+在计算完每个 cluster 的 `FEncodingInfo` 和 `GpuSizes` 后，Nanite 已获得 GPU page 容量估算所需的 cluster 编码信息。接下来，Nanite 会根据 `Settings.TargetMinimumResidencyInKB` 指定的常驻内存大小确定 root page 的数量上限，按照 `AssemblyPartIndex`、mip 层级和 Morton 空间顺序处理各个 cluster group，并结合 cluster 的 GPU 数据大小、GPU page 的布局开销及容量限制，完成 cluster 到 GPU page 的分配和相关映射关系的构建。
+
+Nanite 首先根据指定的常驻内存大小确定 root page 的数量上限：
+
+```cpp
+static uint32 CalculateMaxRootPages(uint32 TargetResidencyInKB)
+{
+    // TargetResidencyInKB 的单位是 KB, 先将 TargetResidencyInKB 乘以 1024 转换成 Byte
+    const uint64 SizeInBytes = uint64(TargetResidencyInKB) << 10;
+
+    // #define NANITE_ROOT_PAGE_GPU_SIZE_BITS   15
+    // #define NANITE_ROOT_PAGE_GPU_SIZE        (1u << NANITE_ROOT_PAGE_GPU_SIZE_BITS)
+    // Nanite 定义的 root page 大小是: (1u << 15) = 32768 Byte = 32 KB
+
+    // 这里计算的是 root page 的数量上限: 先将目标常驻大小向上取整到 32 KB 的整数倍, 同时保证至少有一个 root page. 最终实际生成的 root page 数量还要在 page 分配结束后, 根据总 page 数量确定
+    return (uint32)FMath::Clamp((SizeInBytes + NANITE_ROOT_PAGE_GPU_SIZE - 1u) >> NANITE_ROOT_PAGE_GPU_SIZE_BITS, 1llu, (uint64)MAX_uint32);
+}
+
+// 根据指定的常驻内存大小 Settings.TargetMinimumResidencyInKB 确定 root page 数量上限
+const uint32 MaxRootPages = CalculateMaxRootPages(Settings.TargetMinimumResidencyInKB);
+```
+
+在真正开始分配 cluster 到 GPU page 之前，Nanite 先会通过 `SortGroupClusters()` 方法对每个 cluster group 中的 `Children` 按空间位置重新排序：
+
+```cpp
+static void SortGroupClusters(FClusterDAG& DAG)
+{
+    // 遍历 cluster DAG 中的所有 cluster group
+    for (FClusterGroup& Group : DAG.Groups)
+    {
+        FVector3f SortDirection = FVector3f(1.0f, 1.0f, 1.0f);
+        Group.Children.Sort([&DAG, SortDirection](FClusterRef A, FClusterRef B) {
+            const FCluster& ClusterA = A.GetCluster(DAG);
+            const FCluster& ClusterB = B.GetCluster(DAG);
+            // 点乘 (1, 1, 1) 实际上等于 Center.X + Center.Y + Center.Z
+            float DotA = FVector3f::DotProduct(ClusterA.SphereBounds.Center, SortDirection);
+            float DotB = FVector3f::DotProduct(ClusterB.SphereBounds.Center, SortDirection);
+            return DotA < DotB;
+        });
+    }
+}
+```
+
+Nanite 在这里按照每个 cluster 包围球中心在 `(1, 1, 1)` 方向上的投影值，即包围球中心的 `X + Y + Z`，对每个 cluster group 中的 `Children` 进行升序排序。这是一种计算成本较低的简单空间排序算法，可以为后续按顺序分配 cluster 提供一定的空间连续性，但投影值接近并不严格表示三维空间位置接近，通过这次排序可能会使空间位置比较接近的 cluster 更有可能被分配到同一个或相邻的 GPU page。对于实例引用，这里使用的是它所引用的原始 cluster 的包围球中心，没有应用实例变换。
+
+Nanite 还会排序全部 cluster groups，核心逻辑在 `CalculateClusterGroupPermutation()` 方法中：
+
+```cpp
+static TArray<uint32> CalculateClusterGroupPermutation( const TArray< FClusterGroup >& ClusterGroups )
+{
+    // 每个 group 会构建 FClusterGroupSortEntry 排序键
+    struct FClusterGroupSortEntry {
+        int32   AssemblyPartIndex;
+        int32   MipLevel;
+        uint32  MortonXYZ;
+        uint32  OldIndex;
+    };
+
+    // 当前 cluster DAG 的 groups 数量
+    uint32 NumClusterGroups = ClusterGroups.Num();
+    // 初始化排序键数组 ClusterGroupSortEntries
+    TArray< FClusterGroupSortEntry > ClusterGroupSortEntries;
+    ClusterGroupSortEntries.SetNumUninitialized( NumClusterGroups );
+
+    // 分别计算所有 group 的 LOD 包围球中心在 X/Y/Z 3 个轴上的最小值和最大值
+    FVector3f MinCenter = FVector3f( FLT_MAX, FLT_MAX, FLT_MAX );
+    FVector3f MaxCenter = FVector3f( -FLT_MAX, -FLT_MAX, -FLT_MAX );
+    for( const FClusterGroup& ClusterGroup : ClusterGroups )
+    {
+        const FVector3f& Center = ClusterGroup.LODBounds.Center;
+        MinCenter = FVector3f::Min( MinCenter, Center );
+        MaxCenter = FVector3f::Max( MaxCenter, Center );
+    }
+
+    // 取所有 LOD 包围球中心在 3 个坐标轴上的最大跨度, 并据此计算统一缩放比例. 最大跨度对应的轴会映射到 [0, 1023], 其它轴按相同比例映射到该范围的子区间
+    const float Scale = 1023.0f / (MaxCenter - MinCenter).GetMax();
+
+    // 为每个 group 构造排序键
+    for( uint32 i = 0; i < NumClusterGroups; i++ )
+    {
+        const FClusterGroup& ClusterGroup = ClusterGroups[ i ];
+        FClusterGroupSortEntry& SortEntry = ClusterGroupSortEntries[ i ];
+        // 获取 group 的 LOD 包围球中心
+        const FVector3f& Center = ClusterGroup.LODBounds.Center;
+        // 先减去 MinCenter 把坐标平移到以全局最小点为原点的正区间, 平移到非负坐标范围后使用统一比例 Scale 缩放; + 0.5f 是为了后续转换成整数时采用近似四舍五入, 而不是直接向零截断
+        const FVector3f ScaledCenter = ( Center - MinCenter ) * Scale + 0.5f;
+        // 限制到合法的 10-bit 范围
+        uint32 X = FMath::Clamp( (int32)ScaledCenter.X, 0, 1023 );
+        uint32 Y = FMath::Clamp( (int32)ScaledCenter.Y, 0, 1023 );
+        uint32 Z = FMath::Clamp( (int32)ScaledCenter.Z, 0, 1023 );
+
+        // 设置 AssemblyPartIndex, 非 Assembly Group 的 MAX_uint32 转换为 int32 后表现为 INDEX_NONE (-1)
+        SortEntry.AssemblyPartIndex = ClusterGroup.AssemblyPartIndex;
+        // 设置 Mip 层级
+        SortEntry.MipLevel = ClusterGroup.MipLevel;
+        // 根据当前 group 的 LOD 包围球中心相对于 MinCenter 的偏移, 计算量化后的 10-bit 坐标，并生成三维 Morton 编码
+        SortEntry.MortonXYZ = ( FMath::MortonCode3(Z) << 2 ) | ( FMath::MortonCode3(Y) << 1 ) | FMath::MortonCode3(X);
+        // 判断当前 group 的 Mip 层级是否为奇数
+        if ((ClusterGroup.MipLevel & 1) != 0)
+        {
+            // 如果当前 group 的 Mip 层级是奇数, 那么将其 Morton 编码值的 32 bits 全部取反, 即 MortonXYZ = 0xFFFFFFFFu - MortonXYZ, 也就是说: 原 MortonXYZ 越大, 取反后的 MortonXYZ 越小
+            // 后续排序时仍然按照 Morton 编码值升序排序, 这样对奇数 Mip 层级的 group 来说, 排序后的顺序其实是由原始 Morton 编码值升序变成原始 Morton 编码值降序
+            // 这样相邻 Mip 层级会交替按照正向和反向 Morton 顺序排列, 形成类似蛇形的遍历顺序, 使前一个 Mip 层级的结束位置更接近下一个 Mip 层级的起始位置, 减少跨 Mip 层级处理时的空间跳跃, 并改善后续 GPU page 分配的空间局部性
+            SortEntry.MortonXYZ ^= 0xFFFFFFFFu; // Alternate order so end of one level is near the beginning of the next
+        }
+
+        // 保存 group 的原始索引
+        SortEntry.OldIndex = i;
+    }
+
+    // 对排序键数组排序, 排序遵循:
+    //   - 优先 AssemblyPartIndex 升序;
+    //   - 其次 Mip 层级降序;
+    //   - 最后 Morton 编码值升序
+    ClusterGroupSortEntries.Sort( []( const FClusterGroupSortEntry& A, const FClusterGroupSortEntry& B ) {
+        if (A.AssemblyPartIndex != B.AssemblyPartIndex)
+            return A.AssemblyPartIndex < B.AssemblyPartIndex;
+        if( A.MipLevel != B.MipLevel )
+            return A.MipLevel > B.MipLevel;
+        return A.MortonXYZ < B.MortonXYZ;
+    } );
+
+    // 根据排序后的 ClusterGroupSortEntries 输出最终的排序结果 Permutation 数组, Permutation 中元素的位置表示新的处理顺序, 元素值表示该位置对应的原始 group 索引
+    TArray<uint32> Permutation;
+    Permutation.SetNumUninitialized( NumClusterGroups );
+    for( uint32 i = 0; i < NumClusterGroups; i++ )
+        Permutation[ i ] = ClusterGroupSortEntries[ i ].OldIndex;
+    return Permutation;
+}
+```
+
+在上面的源码中，Nanite 根据每个 cluster group 的 `AssemblyPartIndex`、mip 层级和 LOD 包围球中心对应的 Morton 编码，生成后续 GPU page 分配时的 group 处理顺序。它首先按 `AssemblyPartIndex` 升序排列 group；在相同 `AssemblyPartIndex` 内，再**优先按 mip 层级降序排序，使更粗、靠近 DAG 根部的 group 优先处理并进入前面的 GPU page**，同时避免形成循环的 page 依赖；**mip 层级相同时再按 Morton 空间顺序排列，使空间位置接近的 group 更可能进入同一个或相邻的 GPU page**。另外，**对于奇数 mip 层级的 group，Nanite 会反转其 Morton 顺序，使相邻 mip 层级交替采用正向和反向的空间遍历方式，从而减少跨 mip 层级时的空间跳跃，改善 GPU page 分配的空间连续性**。
+
+在分别对每个 cluster group 内的 `Children` 和所有 cluster groups 排序之后，Nanite 会按照 `CalculateClusterGroupPermutation()` 返回的顺序逐个处理 group。
+
+我们知道，**在 cluster group 的 `Children` 中，`FClusterRef` 可以是普通 cluster 引用，也可以是带有实例信息的 cluster 引用**。普通 cluster 引用指向
+需要实际编码并写入 GPU page 的 cluster；而实例引用则复用其它 cluster 已经编码的几何数据，本身不会重复占用 GPU page。
+
+Nanite 会分两个阶段处理这些引用。首先第一阶段遍历所有未被裁剪的 group，为其中所有普通 cluster 引用分配 GPU page，并跳过实例引用；如果一个混合 group 同时包含普通引用和实例引用，此时仍会先为其中的普通 cluster 分配 page：
+
+```cpp
+// 排序后的 cluster groups
+TArray<uint32> ClusterGroupPermutation = CalculateClusterGroupPermutation(ClusterGroups);
+TSet<uint32> GroupsWithInstances;
+
+for (uint32 i = 0; i < NumClusterGroups; i++)
+{
+    // 按照排序后的顺序逐个处理 group
+    uint32 GroupIndex = ClusterGroupPermutation[i];
+    FClusterGroup& Group = ClusterGroups[GroupIndex];
+
+    // 跳过被裁剪掉的 group
+    if( Group.bTrimmed )
+        continue;
+
+    // 用于记录当前 group 的起始 page 在全局 Pages 数组中的索引
+    uint32 GroupStartPage = MAX_uint32;
+
+    // 当前 group 的 children 是否全是实例引用
+    bool bAllInstances = true;
+
+    // 遍历当前 group 的 children
+    for (FClusterRef Child : Group.Children)
+    {
+        // 第一次分页只处理需要实际写入 page 的 cluster 数据, 因此这里先跳过实例引用
+        // GroupsWithInstances 中保存的是当前 GroupIndex, 后面会根据实例引用的原始 cluster 所在 page 补全当前 group 的 PageRange
+        if( Child.IsInstance() )
+        {
+            GroupsWithInstances.Add(GroupIndex);
+            continue;
+        }
+
+        bAllInstances = false;
+
+        // 获取当前 cluster 的全局索引
+        uint32 ClusterIndex = Child.ClusterIndex;
+
+        FCluster& Cluster = Clusters[ClusterIndex];
+        // 获取当前 cluster 的 FEncodingInfo
+        const FEncodingInfo& EncodingInfo = EncodingInfos[ClusterIndex];
+
+        // 只尝试分配到最后一个 page, 不会搜索之前还有空间的 page
+        FPage* Page = &Pages.Top();
+        // 当前 page 是否是 root page
+        bool bRootPage =  (Pages.Num() - 1u) < MaxRootPages;
+
+        // 尝试将当前 cluster 分配到当前 page 中
+        if (!TryAddClusterToPage(*Page, Cluster, EncodingInfo, bRootPage))
+        {
+            // 如果当前 cluster 不能被分配到当前 page, 那么创建一个新的 page
+            Pages.AddDefaulted();
+            Page = &Pages.Top();
+            bRootPage =  (Pages.Num() - 1u) < MaxRootPages;
+
+            // 尝试将当前 cluster 分配到新的 page 中
+            bool bResult = TryAddClusterToPage(*Page, Cluster, EncodingInfo, bRootPage);
+            check(bResult);
+        }
+        
+        // 是否要为当前 page 创建新的 GroupPart, 判断条件有 2 个: 当前 page 还没有任何 GroupPart 或者当前 page 的最后一个 GroupPart 不属于当前 group
+        if (Page->PartsNum == 0 || Parts[Page->PartsStartIndex + Page->PartsNum - 1].GroupIndex != GroupIndex)
+        {
+            // 当前 page 第一次创建 GroupPart, 记录它在全局 Parts 数组中的起点
+            if (Page->PartsNum == 0)
+            {
+                Page->PartsStartIndex = Parts.Num();
+            }
+            // 当前 page 的 GroupPart 数量 + 1
+            Page->PartsNum++;
+
+            // 在全局 Parts 数组尾部创建一个默认的 GroupPart
+            FClusterGroupPart& Part = Parts.AddDefaulted_GetRef();
+            // 建立新创建的 GroupPart 到所属的 group 的映射关系
+            Part.GroupIndex = GroupIndex;
+        }
+
+        // 当前 cluster 所属 page 在全局 Pages 数组中的索引
+        uint32 PageIndex = Pages.Num() - 1;
+        uint32 PartIndex = Parts.Num() - 1;
+
+        // 获取当前 GroupPart
+        FClusterGroupPart& Part = Parts.Last();
+        // 只有第一个 cluster 进入当前 GroupPart 时, 
+        if (Part.Clusters.Num() == 0)
+        {
+            // 记录当前 GroupPart 在 page clusters 中的起点
+            Part.PageClusterOffset = Page->NumClusters - 1;
+            // 记录当前 GroupPart 所属的 page 在全局 Pages 数组中的索引
+            Part.PageIndex = PageIndex;
+        }
+        // 将当前 cluster 的全局索引添加到当前 GroupPart 中
+        Part.Clusters.Add(ClusterIndex);
+        // 检查 GroupPart 中的 cluster 数量是否不超过可编码上限
+        check(Part.Clusters.Num() <= NANITE_MAX_CLUSTERS_PER_GROUP);
+
+        // 记录当前 cluster 所属的 page 在全局 Pages 数组中的索引
+        Cluster.PageIndex = PageIndex;
+        
+        // 记录当前 group 的起始 page 在全局 Pages 数组中的索引
+        if (GroupStartPage == MAX_uint32)
+        {
+            GroupStartPage = PageIndex;
+        }
+    }
+
+    // 如果当前 group 中全部都是实例引用, 那么它自身没有需要写入 page 的 cluster, 因此这里暂时不构造 PageRangeKey
+    // 后面会根据这些实例引用的原始 cluster 所在 page 构造当前 group 的 PageRangeKey
+    if( bAllInstances )
+    {
+        // groups consisting entirely of instances are not assigned to a page
+        check(GroupStartPage == MAX_uint32);
+        continue;
+    }
+
+    // 计算当前 cluster group 跨越的 page 数量
+    const uint32 NumPages = Pages.Num() - GroupStartPage;
+    // 检查有效范围
+    check(NumPages >= 1);
+    check(NumPages <= NANITE_MAX_GROUP_PARTS_MASK);
+
+    // 当前 cluster group 跨越的 page 中是否有 streaming page
+    const bool bHasStreamingPages = uint32(Pages.Num()) > MaxRootPages;
+    // 构造普通 FPageRangeKey
+    Group.PageRangeKey = FPageRangeKey(GroupStartPage, NumPages, /* bMultiRange = */ false, bHasStreamingPages);
+}
+```
+
+在第一阶段中，Nanite 会按照前面计算出的 group 顺序，依次把每个未被裁剪的 group 中需要实际编码的普通 cluster 分配到 GPU page。**分配时只会尝试当前最后一个 page；如果当前 cluster 放入后会导致 page 超过容量限制，就创建一个新的 page，并将当前 cluster 放入新 page 中**。实例引用在这一阶段不会重复写入几何数据，只会记录当前 group 中存在实例引用，留到第二阶段再补充它所需要的 page。
+
+一个 `FClusterGroupPart` 表示同一个 page 内属于同一个 group 的一段连续 cluster。当当前 page 还没有任何 GroupPart，或者当前 page 的最后一个 GroupPart 不属于正在处理的 group 时，Nanite 就会创建一个新的 GroupPart。因此，**一个 group 跨越多个 page 时会被拆成多个 GroupPart，而一个 page 中也可能同时保存多个 group 的 GroupPart**。每个 GroupPart 会记录它所属的 group、所在的 page、在 page 内的 cluster 起始位置以及包含的所有 cluster；同时，每个 cluster 也会通过 `Cluster.PageIndex` 记录自己最终被分配到的 page。
+
+**由于同一个 group 中的普通 cluster 会在这一阶段被连续处理，所以它们占用的 page 也是一段连续范围。Nanite 会根据第一个 cluster 所在的 `GroupStartPage` 和最终跨越的 `NumPages`，先为当前 group 构造一个普通的 `PageRangeKey`，记录这些普通 cluster 占用了哪些 page，以及其中是否包含 streaming page**。如果当前 group 还包含实例引用，第二阶段会继续把实例引用所需要的 page 补充进这个范围；如果当前 group 全部由实例引用组成，那么它自身没有需要分配到 page 的普通 cluster，因此暂时不会在这一阶段构造 `PageRangeKey`。
+
+另外，分配 cluster 到具体 GPU page 时，会通过 `TryAddClusterToPage()` 方法判断当前 cluster 是否还可以放进当前 page 中，主要是根据将当前 cluster 放进当前 page 后，当前 page 的 GPU 数据大小与 cluster 数量是否会超过规定的上限：
+
+```cpp
+static bool TryAddClusterToPage(FPage& Page, const FCluster& Cluster, const FEncodingInfo& EncodingInfo, bool bRootPage)
+{
+    // 复制当前 page 的全部统计信息, 如果分配失败也不需要回滚
+    FPage UpdatedPage = Page;
+
+    // Page 的 clusters 数量 + 1
+    UpdatedPage.NumClusters++;
+    // 累加待分配 cluster 的 GPU 数据大小
+    UpdatedPage.GpuSizes += EncodingInfo.GpuSizes;
+
+    // 普通几何 cluster
+    if(Cluster.NumTris != 0)
+    {
+        // ClusterBoneInfluences 保存当前普通几何 cluster 中出现过的唯一 BoneIndex, 用于运行时计算蒙皮后的保守包围盒, 它不是逐顶点编码的 BoneInfluence 数据
+        // Page 的 MaxClusterBoneInfluences 统计的是 page 内单个普通几何 cluster 最多保存了多少个这样的 BoneIndex
+        UpdatedPage.MaxClusterBoneInfluences = FMath::Max(UpdatedPage.MaxClusterBoneInfluences, (uint32)EncodingInfo.BoneInfluence.ClusterBoneInfluences.Num());
+    }
+    else
+    {
+        // VoxelBoneInfluences 保存的是根据各骨骼对当前 voxel cluster 的累计影响权重筛选并量化后的骨骼数据
+        // Page 的 MaxVoxelBoneInfluences 统计的是 page 内单个 voxel cluster 最多保存了多少个 VoxelBoneInfluence
+        UpdatedPage.MaxVoxelBoneInfluences = FMath::Max(UpdatedPage.MaxVoxelBoneInfluences, (uint32)EncodingInfo.BoneInfluence.VoxelBoneInfluences.Num());
+    }
+
+    // 写入 page 时, 每个 cluster 都会按照当前 page 中的最大 BoneInfluence 数量预留空间, 这样运行时可以使用统一的步长访问任意 cluster 的数据
+    // 因此这两段数据的大小都是: page 内 cluster 数量 * 单个 cluster 的最大 BoneInfluence 数量 * 单个 BoneInfluence 的大小
+    UpdatedPage.GpuSizes.ClusterBoneInfluence = UpdatedPage.NumClusters * UpdatedPage.MaxClusterBoneInfluences * sizeof(FClusterBoneInfluence);
+    UpdatedPage.GpuSizes.VoxelBoneInfluence = UpdatedPage.NumClusters * UpdatedPage.MaxVoxelBoneInfluences * sizeof(FPackedVoxelBoneInfluence);
+
+    // 检查 page 的 GPU 数据大小是否不超过上限, 会区分 root page 和 streaming page, 当前配置 root page 上限大小是 32 KB, streaming page 上限大小是 128 KB;
+    // GetTotal() 不只是把各段数据大小相加, 还会计算 GPU page header 以及部分数据段所需的 16-byte 对齐
+    // 同时检查 page 中的 cluster 数量是否不超过上限: 当前配置 root page 的 cluster 数量上限是 64, streaming page 的 cluster 数量上限是 256
+    if (UpdatedPage.GpuSizes.GetTotal() <= (bRootPage ? NANITE_ROOT_PAGE_GPU_SIZE : NANITE_STREAMING_PAGE_GPU_SIZE) &&
+        UpdatedPage.NumClusters <= (bRootPage ? NANITE_ROOT_PAGE_MAX_CLUSTERS : NANITE_STREAMING_PAGE_MAX_CLUSTERS))
+    {
+        // 2 个条件都满足, 将更新后的数据写回原 page
+        Page = UpdatedPage;
+        return true;
+    }
+
+    return false;
+}
+```
+
+然后第二个阶段再遍历所有包含实例引用的 group，根据实例引用所指向的原始 cluster 所在 page，构造或补全当前 group 的 `PageRangeKey`。对于全部由实例引用组成的 group，其 page 范围完全由被引用的原始 cluster page 决定：
+
+```cpp
+// 额外处理所有包含实例引用的 cluster group
+{
+    TArray<FPageRangeKey> PageRanges;
+    TArray<uint32> InstancedPages;
+    for (uint32 GroupIndex : GroupsWithInstances)
+    {
+        // 获取当前 cluster group
+        FClusterGroup& Group = ClusterGroups[GroupIndex];
+        // 处理实例引用之前, 当前 group 的 PageRangeKey 要么为空, 要么只记录自身普通 cluster 所占用的一段连续 page
+        // 此时还没有为任何 group 创建包含多个 page 范围的 PageRangeKey
+        check(!Group.PageRangeKey.IsMultiRange());
+
+        PageRanges.SetNum(0, EAllowShrinking::No);
+        InstancedPages.SetNum(0, EAllowShrinking::No);
+
+        // 遍历当前 cluster group 的 children
+        for (FClusterRef Child : Group.Children)
+        {
+            // 只处理实例引用
+            if (Child.IsInstance())
+            {
+                // 实例引用不会重复保存一份 cluster 数据, 这里获取的是它所引用的原始 cluster 所在的 page
+                const uint32 PageIndex = Child.GetCluster(ClusterDAG).PageIndex;
+
+                // 检查实例引用的原始 cluster page 不会出现在当前 group 自身 page 范围的起点之前
+                // 如果当前 group 全部都是实例引用, 它的 PageRangeKey 为空并且 StartIndex 为 0, 这个检查也会成立
+                check(PageIndex >= Group.PageRangeKey.GetStartIndex());
+                // 如果这个 page 已经位于当前 group 自身的 page 范围中, 就不需要重复记录
+                // 这里只收集当前范围末尾之后的额外 page
+                if (PageIndex >= Group.PageRangeKey.GetStartIndex() + Group.PageRangeKey.GetNumPagesOrRanges())
+                {
+                    InstancedPages.AddUnique(PageIndex);
+                }
+            }
+        }
+        
+        // 如果所有实例引用的原始 cluster page 都已经位于当前 group 的 page 范围中, 则继续处理下一个 group
+        if (InstancedPages.Num() == 0)
+        {
+            continue;
+        }
+
+        // 对实例 pages 排序
+        InstancedPages.Sort();
+
+        // 合并连续实例 pages
+        uint32 RangeStartIndex, RangeCount;
+        int32 NextInstancedPage = 0;
+        // 全部都是实例引用的 cluster group 还没有自己的 page 范围
+        if (Group.PageRangeKey.IsEmpty())
+        {
+            // 则使用第 1 个实例 page 初始化当前 cluster group 的 page 范围
+            RangeStartIndex = InstancedPages[0];
+            RangeCount = 1;
+            ++NextInstancedPage;
+        }
+        else
+        {
+            // 既包含普通 cluster 又包含实例引用的 cluster group 使用自己已有的 page 范围
+            RangeStartIndex = Group.PageRangeKey.GetStartIndex();
+            RangeCount = Group.PageRangeKey.GetNumPagesOrRanges();
+        }
+
+        // 整个 cluster group 最终是否包含 streaming page
+        bool bAnyStreamingPages = false;
+        // 遍历所有额外实例 page
+        for (; NextInstancedPage < InstancedPages.Num(); ++NextInstancedPage, ++RangeCount)
+        {
+            const uint32 PageIndex = InstancedPages[NextInstancedPage];
+            // 检查 PageIndex 是否正好与当前连续 page 范围连续, 也就是 PageIndex 是否就是当前连续范围的下一个连续 page
+            if (PageIndex != RangeStartIndex + RangeCount)
+            {
+                // 不连续
+                // 当前连续范围内是否包含 streaming page
+                const bool bHasStreamingPages = RangeStartIndex + RangeCount > MaxRootPages;
+                // 把当前子范围中是否有 streaming page 的状态累计到整个 cluster group
+                bAnyStreamingPages |= bHasStreamingPages;
+                // 把当前连续 page 范围保存为一个普通 FPageRangeKey, 并添加到 PageRanges 中
+                // PageRanges 中的每个元素都只记录一段连续 page, 不能再包含多个 page 范围
+                PageRanges.Emplace(RangeStartIndex, RangeCount, /* bMultiRange = */ false, bHasStreamingPages);
+                // 把当前不连续的 page 设为新范围的起点, 重新开始累计
+                RangeStartIndex = PageIndex;
+                RangeCount = 0;
+            }
+        }
+        // 计算最后一个 page 范围是否包含 streaming page
+        const bool bHasStreamingPages = RangeStartIndex + RangeCount > MaxRootPages;
+        // 将 bHasStreamingPages 累计到整个 cluster group
+        bAnyStreamingPages |= bHasStreamingPages;
+        // 保存最后一个子 page 范围
+        PageRanges.Emplace(RangeStartIndex, RangeCount, /* bMultiRange = */ false, bHasStreamingPages);
+
+        // 如果所有 page 最终仍然在一个连续范围内
+        if (PageRanges.Num() == 1)
+        {
+            // 则无需写 PageRangeLookup, 直接使用这个普通范围
+            Group.PageRangeKey = PageRanges[0];
+            continue;
+        }
+
+        // 为多个子连续 page 范围建立查找表 PageRangeLookup
+        RangeStartIndex = PageRangeLookup.Num();
+        RangeCount = PageRanges.Num();
+
+        // 尝试在 PageRangeLookup 中查找已经存在的相同 PageRanges
+        // 如果只能和 PageRangeLookup 的末尾部分匹配, 后面只需要追加 PageRanges 中还没有保存的部分
+        for (int32 i = 0; i < PageRangeLookup.Num(); ++i)
+        {
+            // 从索引 i 到 PageRangeLookup 末尾还剩 PageRangeLookup.Num() - i 个元素, 同时最多只需要比较 RangeCount 个元素
+            const int32 NumToCompare = FMath::Min<int32>(RangeCount, PageRangeLookup.Num() - i);
+            // 如果剩余元素足够, 检查完整的 PageRanges 是否已经存在
+            // 如果剩余元素不足, 则检查 PageRangeLookup 的末尾是否和新 PageRanges 的开头相同
+            if (CompareItems(&PageRangeLookup[i], PageRanges.GetData(), NumToCompare))
+            {
+                RangeStartIndex = i;
+                break;
+            }
+        }
+
+        // 计算从选定的起点到 PageRangeLookup 末尾已经有多少项
+        // 如果只匹配了 PageRangeLookup 的末尾, 这个值就是新 PageRanges 中已经存在的数量; 如果完整匹配, 这个值也可能大于 RangeCount
+        const int32 NumExisting = PageRangeLookup.Num() - RangeStartIndex;
+        // PageRanges 中还缺多少项需要添加到 PageRangeLookup 中
+        const int32 NumToAdd = RangeCount - NumExisting;
+        if (NumToAdd > 0)
+        {
+            // 只向 PageRangeLookup 中追加缺少的新 PageRanges 中的子连续 page 范围
+            PageRangeLookup.Append(MakeConstArrayView(&PageRanges[NumExisting], NumToAdd));
+        }
+
+        // 创建包含多个 page 范围的 FPageRangeKey, 此时 RangeStartIndex 和 RangeCount 指向的是 PageRangeLookup 中的一段范围, 不再直接表示实际 page
+        Group.PageRangeKey = FPageRangeKey(RangeStartIndex, RangeCount, /* bMultiRange = */ true, bAnyStreamingPages);
+    }
+}
+```
+
+第二阶段只处理前面记录下来的、包含实例引用的 group。由于实例引用复用的是原始 cluster 已经写入的几何数据，所以 Nanite 不会为它重新分配 page，而是找到它所引用的原始 cluster 所在 page，并将这些 page 补充到当前 group 的 `PageRangeKey` 中。如果某个实例引用的 page 已经包含在当前 group 自身的 page 范围中，就不需要重复记录；否则会将它添加到额外的实例 page 列表中。
+
+收集完所有额外的实例 page 后，Nanite 会先对这些 page 排序，再把相邻的 page 合并成一段连续范围。对于既包含普通 cluster 又包含实例引用的 group，合并会从当前 group 已有的 page 范围开始；对于全部由实例引用组成的 group，则直接从第一个实例引用的原始 cluster page 开始构造范围。如果最终所有 page 仍然可以合并成一段连续范围，就直接使用普通的 `PageRangeKey`。
+
+如果这些 page 之间存在间隔，无法用一段连续范围表示，Nanite 就会把每一段连续 page 范围保存到 `PageRangeLookup` 中，再让当前 group 的 `PageRangeKey` 指向 `PageRangeLookup` 中对应的多段范围。写入 `PageRangeLookup` 时还会尽量复用其中已经存在的范围，减少重复数据。这样一来，无论一个 group 中的几何数据实际分布在一段还是多段 page 中，后续都可以通过它的 `PageRangeKey` 找到完整使用这个 group 所需要的所有 page，同时避免为实例引用重复保存 cluster 几何数据。
+
+在结束对 cluster 的 GPU page 分配后，会更新这次分配产生的每个 GroupPart 的包围盒与最小 LOD Error：
+
+```cpp
+// 计算每个 GroupPart 的包围盒与 LOD Error
+for (FClusterGroupPart& Part : Parts)
+{
+    check(Part.Clusters.Num() <= NANITE_MAX_CLUSTERS_PER_GROUP);
+    check(Part.PageIndex < (uint32)Pages.Num());
+
+    FBounds3f Bounds;
+    float MinLODError = MAX_flt;
+    for (uint32 ClusterIndex : Part.Clusters)
+    {
+        const FCluster& Cluster = Clusters[ClusterIndex];
+
+        // 如果当前 cluster 没有对应的 GeneratingGroup, 说明它在当前 DAG 中已经是叶子 cluster, 不会再被更高精度的子 group 替换
+        // 因此将它的 LOD Error 当作 0.0, 这也可以处理 trim 后 cluster 变成叶子的情况
+        const float LODError = (Cluster.GeneratingGroupIndex == MAX_uint32) ? 0.0f : Cluster.LODError;
+
+        // 合并 GroupPart 内所有 clusters 的包围盒
+        Bounds += Cluster.Bounds;
+        // 计算最小 LOD Error, 一个 GroupPart 中只要存在更低 LOD Error 的 cluster, GroupPart 就必须采用更保守的最小值
+        MinLODError = FMath::Min(MinLODError, LODError);
+    }
+
+    // 将包围盒与 LOD Error 写回 GroupPart
+    Part.Bounds = Bounds;
+    Part.MinLODError = MinLODError;
+}
+```
+
+完成 GPU page 分配后，Nanite 最终得到了 `Pages`、`GroupParts` 和 `PageRangeLookup`，同时更新了每个 cluster 的 `PageIndex`、每个 cluster group 的 `PageRangeKey`，以及当前 Nanite 网格最终生成的 root page 数量 `Resources.NumRootPages`。
+
+`Pages` 数组记录最终生成的所有 GPU page，以及每个 page 中的 cluster 数量、GPU 数据大小和包含的 GroupPart 范围。每个实际编码的普通 cluster 会通过 `Cluster.PageIndex` 记录自己所在的 page；实例引用则不会重复分配 page，而是继续使用它所引用的原始 cluster 所在的 page。
+
+`GroupParts` 记录 cluster group 被 page 边界拆分后的结果。每个 GroupPart 表示某个 group 位于一个具体 page 中的那部分 cluster，并保存它所属的 group、所在的 page、在 page 内的 cluster 起始位置、包含的 cluster，以及对应的包围盒与最小 LOD Error。这些数据会在后续构建 Hierarchy 和生成 Fixup 时使用。
+
+每个未被裁剪并参与本次编码的 group，最终会通过 `PageRangeKey` 记录使用该 group 所需要的所有 GPU page。如果这些 page 连续，`PageRangeKey` 会直接记录起始 page 和 page 数量；而如果实例引用使这些 page 分布在多个不连续范围中，就会将各段子连续范围保存到 `PageRangeLookup`，再由 `PageRangeKey` 间接引用。
+
+最后，Nanite 会根据实际生成的 page 数量和 `MaxRootPages` 得到 `Resources.NumRootPages`，从而确定哪些 page 作为 root page 始终驻留在显存中，哪些 page 作为 streaming page 需要按需流送。
 
 ## 3. References
 
 - [Nanite: A Deep Dive](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
 - [GAMES 104: GPU-Driven Geometry Pipeline - Nanite](https://www.piccoloengine.com/merch/8)
+
+<!-- 需要注意的是，上面这一步只是计算当前 cluster 的 UV 解码元数据以及每顶点 UV 需要的 bit 数，真正写入顶点属性数据发生在 `EncodeGeometryData()` 中。写入时 Nanite 会再次调用 `EncodeUVFloat()` 得到全局 UV 编码值，然后减去 `UVInfo.Min` 得到当前 cluster 内的局部偏移值，并把这个局部偏移保存到 `PackedUVs` 中：
+
+```cpp
+// Generate quantized texture coordinates
+TArray<FIntVector2, TInlineAllocator<NANITE_MAX_CLUSTER_VERTICES*NANITE_MAX_UVS>> PackedUVs;
+PackedUVs.AddUninitialized( NumClusterVerts * Cluster.Verts.Format.NumTexCoords );
+
+const uint32 NumMantissaBits = NANITE_UV_FLOAT_NUM_MANTISSA_BITS;
+for( uint32 UVIndex = 0; UVIndex < Cluster.Verts.Format.NumTexCoords; UVIndex++ )
+{
+    const FUVInfo& UVInfo = EncodingInfo.UVs[UVIndex];
+    const uint32 NumTexCoordValuesU = 1u << UVInfo.NumBits.X;
+    const uint32 NumTexCoordValuesV = 1u << UVInfo.NumBits.Y;
+
+    for (uint32 LocalVertexIndex = 0; LocalVertexIndex < NumUniqueToVertices; LocalVertexIndex++)
+    {
+        uint32 VertexIndex = LocalVertexIndex;
+        if( bUseVertexRefs )
+            VertexIndex = UniqueToVertexIndex[LocalVertexIndex];
+
+        const FVector2f UV = (UVIndex < Cluster.Verts.Format.NumTexCoords) ? Cluster.Verts.GetUVs(VertexIndex)[UVIndex] : FVector2f(0.0f);
+
+        // 重新把当前顶点 UV 编码成全局 UV 编码值
+        uint32 EncodedU = EncodeUVFloat(UV.X, NumMantissaBits);
+        uint32 EncodedV = EncodeUVFloat(UV.Y, NumMantissaBits);
+
+        check(EncodedU >= UVInfo.Min.X);
+        check(EncodedV >= UVInfo.Min.Y);
+        // 写入当前 cluster 内部属性流之前, 先转换成相对于 UVInfo.Min 的局部偏移值
+        EncodedU -= UVInfo.Min.X;
+        EncodedV -= UVInfo.Min.Y;
+        
+        check(EncodedU >= 0 && EncodedU < NumTexCoordValuesU);
+        check(EncodedV >= 0 && EncodedV < NumTexCoordValuesV);
+        PackedUVs[NumClusterVerts * UVIndex + VertexIndex].X = (int32)EncodedU;
+        PackedUVs[NumClusterVerts * UVIndex + VertexIndex].Y = (int32)EncodedV;
+    }       
+}
+```
+
+也就是说，`UVInfo.Min` 保存的是当前 cluster 内 U/V 分量各自的全局 UV 编码最小值，而 `PackedUVs` 保存的是每个顶点相对于这个最小值的局部偏移值。这样一来，后续真正需要逐顶点保存的 UV 值就不再是完整的 20-bit 全局编码值，而是当前 cluster 内的局部范围 `[0, UVMax - UVMin]`，因此可以使用 `UVInfo.NumBits.X` 和 `UVInfo.NumBits.Y` 指定的更少 bit 数写入属性数据。
+
+不过 Nanite 写属性字节流时，并不是直接逐顶点写 `PackedUVs` 中的局部偏移绝对值，而是先对当前顶点的 UV 局部偏移和上一个顶点的 UV 局部偏移求差值，然后经过 `ShortestWrap()` 和 ZigZag 编码写入 low/mid/high byte streams：
+
+```cpp
+// UV
+for (uint32 TexCoordIndex = 0; TexCoordIndex < Cluster.Verts.Format.NumTexCoords; TexCoordIndex++)
+{
+    const int32 NumTexCoordBitsU = EncodingInfo.UVs[TexCoordIndex].NumBits.X;
+    const int32 NumTexCoordBitsV = EncodingInfo.UVs[TexCoordIndex].NumBits.Y;
+    const uint32 BytesPerTexCoordComponent = (FMath::Max(NumTexCoordBitsU, NumTexCoordBitsV) + 7) / 8;
+        
+    FIntVector2 PrevUV = FIntVector2::ZeroValue;
+    for (uint32 LocalVertexIndex = 0; LocalVertexIndex < NumUniqueToVertices; LocalVertexIndex++)
+    {
+        uint32 VertexIndex = LocalVertexIndex;
+        if( bUseVertexRefs )
+            VertexIndex = UniqueToVertexIndex[LocalVertexIndex];
+
+        const FIntVector2 UV = PackedUVs[NumClusterVerts * TexCoordIndex + VertexIndex];
+
+        // 写入的是当前局部偏移值相对于上一个顶点局部偏移值的差值
+        FIntVector2 UVDelta = UV - PrevUV;
+        UVDelta.X = ShortestWrap(UVDelta.X, NumTexCoordBitsU);
+        UVDelta.Y = ShortestWrap(UVDelta.Y, NumTexCoordBitsV);
+        WriteZigZagDelta(UVDelta.X, BytesPerTexCoordComponent);
+        WriteZigZagDelta(UVDelta.Y, BytesPerTexCoordComponent);
+        PrevUV = UV;
+    }
+}
+```
+
+这里的 `ShortestWrap()` 会把差值限制到当前 UV 分量 bit 数可以表达的最短环绕差值范围内，随后 `WriteZigZagDelta()` 会把可能为负的差值转换成无符号整数，并按 `BytesPerTexCoordComponent` 写入低/中/高字节流。这样做的目的和 Position、Normal、Color 的写法一致，都是利用顶点顺序上的局部连续性，让写入的属性字节流更紧凑。
+
+前面计算出的 `FUVInfo` 最终还会被 `WritePages()` 写入当前 cluster 的 DecodeInfo 数据段中。写入时 Nanite 会把 `FUVInfo` 打包成 `FPackedUVHeader`，每个 UV 通道对应一个 `FPackedUVHeader`：
+
+```cpp
+static void PackUVHeader(FPackedUVHeader& PackedUVHeader, const FUVInfo& UVInfo)
+{
+    check(UVInfo.NumBits.X <= NANITE_UV_FLOAT_MAX_BITS          && UVInfo.NumBits.Y <= NANITE_UV_FLOAT_MAX_BITS);
+    check(UVInfo.Min.X     <  (1u << NANITE_UV_FLOAT_MAX_BITS)  && UVInfo.Min.Y     <  (1u << NANITE_UV_FLOAT_MAX_BITS));
+    
+    PackedUVHeader.Data.X = (UVInfo.Min.X << 5) | UVInfo.NumBits.X;
+    PackedUVHeader.Data.Y = (UVInfo.Min.Y << 5) | UVInfo.NumBits.Y;
+}
+```
+
+`FPackedUVHeader.Data.X` 和 `FPackedUVHeader.Data.Y` 分别保存 U/V 两个分量的解码元数据。其中低 5 bits 保存当前分量的 `NumBits`，高位保存当前分量的 `Min` 全局 UV 编码值。运行时 shader 会通过 `UnpackUVHeader()` 反向拆出 `NumBits` 和 `Min`：
+
+```hlsl
+FUVHeader UnpackUVHeader(uint2 Data)
+{
+    FUVHeader Range;
+
+    Range.NumBits.x         = BitFieldExtractU32(Data.x, 5, 0);
+    Range.Min.x             = Data.x >> 5;
+    
+    Range.NumBits.y         = BitFieldExtractU32(Data.y, 5, 0);
+    Range.Min.y             = Data.y >> 5;
+    
+    Range.NumMantissaBits   = NANITE_UV_FLOAT_NUM_MANTISSA_BITS;
+
+    return Range;
+}
+```
+
+解码某个顶点 UV 时，shader 会先从属性 bitstream 中读取当前顶点保存的局部偏移 `Packed`，然后通过 `UVHeader.Min + Packed` 还原出全局 UV 编码值，最后再调用 `DecodeUVFloat()` 解码回 float UV：
+
+```hlsl
+float2 UnpackTexCoord(uint2 Packed, FUVHeader UVHeader)
+{
+    const uint2 GlobalUV = UVHeader.Min + Packed;
+
+    return float2(  DecodeUVFloat(GlobalUV.x, UVHeader.NumMantissaBits),
+                    DecodeUVFloat(GlobalUV.y, UVHeader.NumMantissaBits));
+}
+```
+
+另外，`PackCluster()` 还会根据每个 UV 通道的 `NumBits.X + NumBits.Y` 累加出 `Cluster.UVBitOffsets`。这个值用于记录每个 UV 通道在每顶点属性 bitstream 中的起始 bit 偏移：
+
+```cpp
+uint32 UVBitOffsets = 0;
+uint32 BitOffset = 0;
+for (uint32 i = 0; i < NumTexCoords; i++)
+{
+    check(BitOffset < 256);
+    UVBitOffsets |= BitOffset << (i * 8);
+    const FUVInfo& UVInfo = EncodingInfo.UVs[i];
+    BitOffset += UVInfo.NumBits.X + UVInfo.NumBits.Y;
+}
+
+OutCluster.UVBitOffsets = UVBitOffsets;
+```
+
+运行时 shader 解码指定 `TexCoordIndex` 时，会先从 `Cluster.UVBitOffsets` 中取出当前 UV 通道在属性 bitstream 中的起始偏移，再根据 `UVHeader.NumBits` 读取 U/V 两个局部偏移值：
+
+```hlsl
+const uint UVBitOffset = ((Cluster.UVBitOffsets >> (TexCoordIndex * 8u)) & 0xFFu);
+const uint BitOffset = 2 * Cluster.NormalPrecision + dot(NumColorComponentBits, 1u) + UVBitOffset;
+
+FBitStreamReaderState AttributeStream0 = BitStreamReader_Create_Aligned(AttributeDataOffset, BitOffset + TriIndices.x * Cluster.BitsPerAttribute, 2 * NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+
+const FUVHeader UVHeader = GetUVHeader(ClusterPageData, DecodeInfoOffset, TexCoordIndex);
+uint2 UVBits0 = BitStreamReader_Read2_RO(ClusterPageData, AttributeStream0, UVHeader.NumBits, NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+float2 TexCoord0 = UnpackTexCoord(UVBits0, UVHeader);
+```
+
+因此，顶点 UV 的完整编码链路可以概括为：先把 float UV 通过 `EncodeUVFloat()` 转成可排序的全局 UV 编码值；再在 `CalculateEncodingInfo()` 中统计当前 cluster 的 `Min/Max` 和 `NumBits`；实际写入属性数据时保存相对于 `Min` 的局部偏移，并进一步写成局部偏移之间的 delta；运行时 shader 再通过 `UVHeader.Min + Packed` 还原全局 UV 编码值，并调用 `DecodeUVFloat()` 得到最终的 float UV。 -->

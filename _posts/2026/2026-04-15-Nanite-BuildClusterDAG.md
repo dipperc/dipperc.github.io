@@ -21,7 +21,7 @@ category: Unreal Engine
 - [3. A Cut of Cluster DAG](#3-a-cut-of-cluster-dag)
 - [4. References](#4-references)
 
-本篇笔记是 Unreal Engine 的 Nanite 系统中关于构建 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release。
+本篇笔记是 Unreal Engine 的 Nanite 系统中关于构建 Cluster DAG 的源码分析理解，基于引擎版本 5.7.3 release
 
 ## 1. 构建 Leaf Cluster
 
@@ -46,7 +46,7 @@ FORCEINLINE uint32 Cycle3( uint32 Value )
 }
 ```
 
-对于有向三角形边 EdgeIndex，分别取其 2 个端点的位置 `Position0` 和 `Position1`，以 `(Position0, Position1)` 顺序计算这条有向三角形边的 hash，最后将结果添加到 `FEdgeHash::HashTable` 中，其中 Key 是有向三角形边 EdgeIndex 的 hash，Value 是有向三角形边的索引 EdgeIndex：
+对于有向三角形边 EdgeIndex，分别取其 2 个端点的位置 `Position0` 和 `Position1`，以 `(Position0, Position1)` 顺序计算这条有向三角形边的 hash，最后将结果添加到 `FEdgeHash::HashTable` 中，其中 Key 是有向三角形边 EdgeIndex 的 hash，Value 是有向三角形边的索引 EdgeIndex ：
 
 ```cpp
 template< typename FGetPosition >
@@ -113,7 +113,7 @@ void ForAllMatching( int32 EdgeIndex, bool bAdd, FGetPosition&& GetPosition, Fun
 }
 ```
 
-通过 `FEdgeHash::HashTable` 查找每条有向三角形边的共享边，并将其共享边数量写入 `FAdjacency::Direct`：
+通过 `FEdgeHash::HashTable` 查找每条有向三角形边的共享边，并将其共享边数量写入 `FAdjacency::Direct` ：
 
 ```cpp
 // 并行遍历所有有向三角形边
@@ -296,7 +296,7 @@ inline uint32 FDisjointSet::Find( uint32 i )
 
 首先构建三角形图（Triangle Graph），每个三角形是图中的一个节点，节点与节点之间的边有两类：第一类是**拓扑邻接**，第二类是**空间局部性邻接**，最后使用 METIS 递归二分图，直到每个分区图不超过 128 个节点，也就是 128 个三角形。
 
-Nanite 中一个 cluster 包含 128 个三角形（`FCluster::ClusterSize=128`），在划分时每个分区三角形的目标大小是 `124 ～ 128`：
+Nanite 中一个 cluster 包含 128 个三角形（`FCluster::ClusterSize=128`），在划分时每个分区三角形的目标大小是 `124 ～ 128` ：
 
 ```cpp
 FGraphPartitioner Partitioner( NumTriangles, FCluster::ClusterSize - 4, FCluster::ClusterSize );
@@ -496,9 +496,9 @@ for( uint32 i = 0; i < NumElements; i++ )
 }
 ```
 
-对于按 Morton 编码排好序的三角形 `Indexes`，Nanite **只会为属于较小连续连通岛区间内的三角形构建空间局部邻接信息**，也就是该区间内的三角形数量小于 128。对于这些三角形，会沿排好序后的 `Indexes` 向前、后两个方向各最多执行 16 次搜索迭代，搜索过程中会**跳过同连通岛 ID 或不同分组 ID（在这里，不同分组 ID 指的是不同材质 ID）**的连续区间，从剩余候选中按**实际 3D 空间距离选出最多 5 个**最近三角形，并构建双向的空间局部邻接关系。
+对于按 Morton 编码排好序的三角形 `Indexes`，Nanite **只会为属于较小连续连通岛区间内的三角形构建空间局部邻接信息**，也就是该区间内的三角形数量小于 128。对于这些三角形，会沿排好序后的 `Indexes` 向前、后两个方向各最多执行 16 次搜索迭代，搜索过程中会**跳过同连通岛 ID 或不同分组 ID （在这里，不同分组 ID 指的是不同材质 ID）**的连续区间，从剩余候选中按**实际 3D 空间距离选出最多 5 个**最近三角形，并构建双向的空间局部邻接关系。
 
-从这里可以看出，Nanite 在构建空间局部邻接信息时，会尝试在 **3D 空间上接近、材质相同，但不属于同一几何连通块的三角形之间建立空间局部邻接关系**。
+从这里可以看出，Nanite 在构建空间局部邻接信息时，会尝试在**3D 空间上接近、材质相同，但不属于同一几何连通块的三角形之间建立空间局部邻接关系**。
 
 最后，Nanite 根据前面得到的两类邻接信息，构建 METIS 使用的图结构，并进行递归二分：
 
@@ -538,7 +538,7 @@ check( Partitioner.Ranges.Num() );
 
 图节点之间，先通过共享边信息添加拓扑邻接权重，拓扑邻接的权重是 `260`，说明 **Nanite 强烈倾向将共享真实几何边的三角形划分在同一个分区**；再通过空间局部邻接信息添加空间局部邻接权重，空间局部邻接的权重是 `1`，远远低于拓扑邻接的权重，说明 Nanite 希望**3D 空间上靠近的三角形，尽量别分太远，但如果和拓扑邻接冲突，则拓扑邻接的优先级要高得多**。
 
-这里简单介绍一下 METIS：
+这里简单介绍一下 METIS ：
 
 METIS 是一个用于**图划分、有限元网格划分、稀疏矩阵重排序**的库，这里有一个关于怎么使用 METIS 库进行图划分的文章[使用 METIS 软件包进行图划分](https://www.jianshu.com/p/55e6b6897057)。另外，关于 METIS 的控制参数 `Options[ METIS_OPTION_UFACTOR ]`，它用于控制划分后子分区之间允许的不平衡程度（以千分之一为单位），简单来说：就是划分后每个子分区多可以比“理想大小”大多少。假设一个图一共有 N 个节点，要将其划分为 `k` 个子分区，那么理想情况下，每个子分区应该包含 `N/k` 个节点，如果 `Options[ METIS_OPTION_UFACTOR ] = 20`，那么每个子分区最多比理想大小多 2%（20/1000=0.02）的节点数
 
@@ -761,7 +761,7 @@ for( int i = 0; i < Indexes.Num(); i += 3 )
 EdgeLength = FMath::Sqrt( MaxEdgeLength2 );
 ```
 
-其中，`Bounds` 是 cluster 的 AABB；包围球 `SphereBounds`；LOD 包围范围 `LODBounds`，在 leaf cluster 中其初始为 `LODBounds = SphereBounds`；以及 cluster 中所有三角形的面积和 `SurfaceArea` 与 cluster 中所有三角形中最长的边的边长 `EdgeLength`
+其中，`Bounds` 是 cluster 的 AABB；包围球 `SphereBounds`；LOD 包围球 `LODBounds`，在 leaf cluster 中其初始为 `LODBounds = SphereBounds`；以及 cluster 中所有三角形的面积和 `SurfaceArea` 与 cluster 中所有三角形中最长的边的边长 `EdgeLength`
 
 **需要注意的是**，对于 leaf cluster，Nanite 会将其 `EdgeLength` 设置为负数：
 
@@ -1385,14 +1385,14 @@ return FMath::Sqrt( MaxErrorSqr ) * InvScale;
 
 `MaxErrorSqr` 记录的是本轮网格简化过程中，所有实际执行折叠的边引入的**最大（Max）几何误差的平方**，另外由于在简化之前还对网格进行了统一尺度的缩放，所以还需要撤销此缩放对误差的影响。
 
-我们知道，Nanite 在构建 cluster DAG 时，会把当前 LOD 层级 group 中的所有 children clusters 会通过合并
-简化、再切分的方式生成下一层级的 parent clusters，**parent clusters 表示的是更粗一级 childen clustes 的近似**，而网格简化返回的最大几何误差 `SimplifyError` 表示的就是：**当用 parent clusters 替代 children clusters 时，想对于 children clusters 的最大几何误差是多少**。
+我们知道，Nanite 在构建 cluster DAG 时，会把当前 LOD 层级 group 中的所有 `Children` 通过合并
+简化、再切分的方式生成下一层级的 parent clusters，**parent clusters 表示的是更粗一级 childen clustes 的近似**，而网格简化返回的最大几何误差 `SimplifyError` 表示的就是：**当用 parent clusters 替代 `Children` 时，想对于 `Children` 的最大几何误差是多少**。
 
 每个 cluster 自己都有一个 `LODError`，Nanite 是怎么去设置每个 cluster 的 `LODError` 的呢？
 
 首先对于 leaf cluster，它的 `LODError` 是 `0.0`，leaf cluster 表示的是最精细的一层，它是 LOD0；
 
-而对于更上层的 cluster，在 `Reduce` group 的过程中，会先收集 group 中 children clusters 中的最大 `LODError`：
+而对于更上层的 cluster，在 `Reduce` group 的过程中，会先收集 group 中 `Children` 中的最大 `LODError`：
 
 ```cpp
 for( FClusterRef Child : Group.Children )
@@ -1407,7 +1407,7 @@ for( FClusterRef Child : Group.Children )
 }
 ```
 
-在网格简化之后，继续从网格简化返回的最大几何误差和 children clusters 的最大 `LODError` 中取最大值：
+在网格简化之后，继续从网格简化返回的最大几何误差和 `Children` 的最大 `LODError` 中取最大值：
 
 ```cpp
 Group.ParentLODError = FMath::Max( Group.ParentLODError, SimplifyError );
@@ -1523,11 +1523,11 @@ while(1)
 
 对于原始 mesh，Nanite 首先将其切分为 leaf clusters，这些 leaf clusters 的 `MipLevel` 为 `0`。
 
-随后从 leaf clusters 开始，每轮以当前层 clusters 为输入进行分 group；每个 group 的全部 children clusters 会被整体合并、简化，再重新切分为一个或多个更粗的下一层的 parent clusters。
+随后从 leaf clusters 开始，每轮以当前层 clusters 为输入进行分 group；每个 group 的全部 `Children` 会被整体合并、简化，再重新切分为一个或多个更粗的下一层的 parent clusters。
 
 由于一个 group 生成的所有 parent clusters 都共同依赖该 group 的全部 children clusters，所以这些 parent clusters 都通过同一个 `GeneratingGroupIndex` 关联到该 group，并且**从任意 parent 向更细层展开时，都必须替换为该 group 的全部 children**。这种多 parent 共享同一组 children 的关系似的最终构建的层级结构是 DAG。
 
-另外，由一个 group 生成的所有 parent clusters 都共享使用同一个几何误差，这个误差不仅仅会**覆盖所有 children clusters 的几何误差（取 children 中最大）**，还会**覆盖网格简化后引入的几何误差（children 中最大与 `SimplifyError` 中再取最大）**，这保证了**整个 DAG 由 root cluster 到 leaf cluster 的几何误差是单调递减的**。
+另外，由一个 group 生成的所有 parent clusters 都共享使用同一个几何误差，这个误差不仅仅会**覆盖所有 `Children` 的几何误差（取 children 中最大）**，还会**覆盖网格简化后引入的几何误差（children 中最大与 `SimplifyError` 中再取最大）**，这保证了**整个 DAG 由 root cluster 到 leaf cluster 的几何误差是单调递减的**。
 
 每轮生成的 parent clusters 构成下一轮的输入，最终收敛到一个最粗的 root cluster。Nanite 最后会额外创建一个仅包含该 root cluster 的 root group，该 root group 作为 DAG 遍历、层级编码与流式加载的统一入口。
 
